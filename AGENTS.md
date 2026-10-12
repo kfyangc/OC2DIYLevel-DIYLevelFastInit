@@ -26,6 +26,16 @@ cp bin/Release/DIYLevelFastInit.dll "<GameDir>/BepInEx/plugins/"
   all `info_*` bundles, consumed in directory order, 15s timeout → sync fallback).
 - Harmony **postfix** on `DIYLevelEntryUI.AddUI`: re-syncs the menu button list
   (`HealLevelSetButtons`), because the original builds it only once (snapshot guard).
+- Harmony prefix+postfix on `DIYLevelAssetBundleManager.SetupSceneDirectoryData`
+  (`SceneDirectoryCache`, since 1.5.0): serve a cached directory while the level-set
+  list is unchanged; warm-built in the background. The cached configs reference
+  `RuntimePrefabManager` clones (custom burger/pizza assembly `m_platingPrefab`), which
+  every `StartEmptySession` destroys via `ClearAllRuntimePrefabs(isQuit:true)` right
+  before rebuilding — so since 1.5.1 that clear is skipped while the cache is live
+  (prefix on `ClearAllRuntimePrefabs`), clones are accounted via a postfix on
+  `CloneAsInactivePrefab`, and superseded clones are destroyed at the next blanket-clear
+  point (the old session is gone there). An epoch guard makes an in-flight warm discard
+  its directory if a blanket clear ran mid-build.
 - Private statics of the target plugin are set via reflection (`AccessTools.Field`):
   `commonBundle`, `diyLevelCover`, `diyLevelGameSessionPrefab`, `configTemplateSO`,
   `Instance`, `levelSetSelectionMenu`, and method `AddLevelSetButton`. These names are the

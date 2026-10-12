@@ -20,7 +20,9 @@ namespace DIYLevelFastInit
     /// and all level-set info bundles load in a background coroutine. Also fixes the
     /// original's missing idempotence guard, adds hot sync (the menu button), and caches
     /// the scene directory so the save-dialog no longer rebuilds a level config for
-    /// every level of every set on each open.
+    /// every level of every set on each open. While that cache is live, the blanket
+    /// RuntimePrefabManager clears that pairing depends on are narrowed to superseded
+    /// clones, so cached assembly configs keep valid prefab references.
     /// </summary>
     [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
     [BepInProcess("Overcooked2.exe")]
@@ -29,7 +31,7 @@ namespace DIYLevelFastInit
     {
         public const string PluginGuid = "oc2.diylevel.fastinit";
         public const string PluginName = "DIYLevel FastInit";
-        public const string PluginVersion = "1.5.0";
+        public const string PluginVersion = "1.5.1";
 
         internal static ManualLogSource Log;
 
@@ -97,6 +99,33 @@ namespace DIYLevelFastInit
             else
             {
                 Log.LogWarning("SetupSceneDirectoryData not found; directory cache inactive");
+            }
+            // StartEmptySession pairs ClearAllRuntimePrefabs(isQuit:true) with a full
+            // directory rebuild: the clear destroys the RuntimePrefabManager clones that
+            // custom burger/pizza assembly configs reference (OrderDefinitionNode
+            // m_platingPrefab), and the rebuild recreates them. Serving the cache removes
+            // the rebuild half of that pairing, so the destroy half must be skipped while
+            // the cache is live; SceneDirectoryCache accounts for the clones instead.
+            MethodInfo clearAll = AccessTools.Method(typeof(RuntimePrefabManager), "ClearAllRuntimePrefabs");
+            if (clearAll != null)
+            {
+                harmony.Patch(clearAll,
+                    prefix: new HarmonyMethod(typeof(FastInitPlugin), nameof(ClearRuntimePrefabsPrefix)),
+                    postfix: new HarmonyMethod(typeof(FastInitPlugin), nameof(ClearRuntimePrefabsPostfix)));
+            }
+            else
+            {
+                Log.LogWarning("ClearAllRuntimePrefabs not found; runtime-prefab guard inactive");
+            }
+            MethodInfo clonePrefab = AccessTools.Method(typeof(RuntimePrefabManager), "CloneAsInactivePrefab");
+            if (clonePrefab != null)
+            {
+                harmony.Patch(clonePrefab,
+                    postfix: new HarmonyMethod(typeof(FastInitPlugin), nameof(ClonePrefabPostfix)));
+            }
+            else
+            {
+                Log.LogWarning("CloneAsInactivePrefab not found; clone tracking inactive");
             }
             Log.LogInfo("DIYLevel FastInit ready: level bundles load async, menu no longer blocks.");
         }
@@ -270,12 +299,75 @@ namespace DIYLevelFastInit
                 List<KeyValuePair<string, LevelSetInfoSO>> infos = DIYLevelAssetBundleManager.levelSetInfos;
                 if (__result != null && infos != null)
                 {
-                    SceneDirectoryCache.Publish(__result, infos);
+                    SceneDirectoryCache.Publish(__result, infos, false);
                 }
             }
             catch (Exception e)
             {
                 Log.LogDebug("SetupDirectoryPostfix: " + e.Message);
+            }
+        }
+
+        // Harmony prefix on RuntimePrefabManager.ClearAllRuntimePrefabs. isQuit:true runs
+        // from StartEmptySession (every save-dialog open) and from the StartScreen scene
+        // load; both destroy the clones the cached assembly configs reference, with no
+        // rebuild to restore them while the cache is live. Skip the clear in that case
+        // and let SceneDirectoryCache collect superseded clones instead. Without a live
+        // cache the original runs: the following build recreates everything, exactly the
+        // pre-1.5.1 behavior. isQuit:false (level exit) only touches clearOnRestart
+        // clones and always runs.
+        private static bool ClearRuntimePrefabsPrefix(bool isQuit, ref bool __state)
+        {
+            __state = false;
+            if (!isQuit)
+            {
+                return true;
+            }
+            bool skip = false;
+            try
+            {
+                List<KeyValuePair<string, LevelSetInfoSO>> infos = DIYLevelAssetBundleManager.levelSetInfos;
+                skip = infos != null && infos.Count > 0 && SceneDirectoryCache.Matches(infos);
+            }
+            catch (Exception e)
+            {
+                Log.LogDebug("ClearRuntimePrefabsPrefix: " + e.Message);
+            }
+            if (skip)
+            {
+                SceneDirectoryCache.OnBlanketClearSkipped();
+                __state = true;
+                return false;
+            }
+            SceneDirectoryCache.OnBlanketClearRunning();
+            return true;
+        }
+
+        private static void ClearRuntimePrefabsPostfix(bool isQuit, bool __state)
+        {
+            if (isQuit && !__state)
+            {
+                // The original clear destroyed every tracked clone.
+                SceneDirectoryCache.ResetCloneTracking();
+            }
+        }
+
+        // Harmony postfix on RuntimePrefabManager.CloneAsInactivePrefab: record each
+        // clone so the cache can later destroy exactly the superseded ones and keep the
+        // dialog-open backstop the original blanket clear provided for the rest.
+        private static void ClonePrefabPostfix(GameObject __result, bool clearOnRestart)
+        {
+            if (__result == null)
+            {
+                return;
+            }
+            try
+            {
+                SceneDirectoryCache.RecordClone(__result, clearOnRestart);
+            }
+            catch (Exception e)
+            {
+                Log.LogDebug("ClonePrefabPostfix: " + e.Message);
             }
         }
 
@@ -895,16 +987,42 @@ namespace DIYLevelFastInit
     /// level-set list is unchanged (entry-by-entry, order-sensitive); rebuilt in the
     /// background after the initial load or a hot sync. Abandoned directories are
     /// deliberately leaked: lingering sessions may still reference them, and destroying
-    /// the tree could take shared bundle assets down with it.
+    /// the tree could take shared bundle assets down with it. The configs reference
+    /// RuntimePrefabManager clones (custom burger/pizza assembly prefabs), so while the
+    /// cache is live the blanket isQuit:true clears are skipped (see
+    /// ClearRuntimePrefabsPrefix) and the clones are accounted here instead; superseded
+    /// clones are destroyed at the next blanket-clear point, which is where the original
+    /// code destroyed everything.
     /// </summary>
     internal static class SceneDirectoryCache
     {
         private static readonly FieldInfo FiStarBoundaries =
             AccessTools.Field(typeof(SceneDirectoryData.PerPlayerCountDirectoryEntry), "m_PCStarBoundaries");
+        private static readonly FieldInfo FiQuitClones =
+            AccessTools.Field(typeof(RuntimePrefabManager), "runtimePrefabsClearOnQuit");
+        private static readonly FieldInfo FiRestartClones =
+            AccessTools.Field(typeof(RuntimePrefabManager), "runtimePrefabsClearOnRestart");
 
         private static SceneDirectoryData _cached;
         private static List<KeyValuePair<string, LevelSetInfoSO>> _cachedSets;
         private static bool _warming;
+
+        // Clone accounting. clearOnRestart:false clones (the ones only isQuit:true clears
+        // destroy): _liveClones back the published cache, the building lists back the two
+        // possible in-flight builds, _ephemeralClones come from level-entry builds whose
+        // configs die with the level. _garbageClones back superseded caches, destroyed
+        // lazily at the next blanket-clear point. _restartClones (clearOnRestart:true)
+        // exist only to keep the dialog-open backstop of the original blanket clear.
+        private static List<GameObject> _liveClones = new List<GameObject>();
+        private static List<GameObject> _warmBuildingClones = new List<GameObject>();
+        private static List<GameObject> _syncBuildingClones = new List<GameObject>();
+        private static List<GameObject> _garbageClones = new List<GameObject>();
+        private static List<GameObject> _ephemeralClones = new List<GameObject>();
+        private static List<GameObject> _restartClones = new List<GameObject>();
+        private static bool _warmActive;
+        // Bumped whenever a blanket isQuit:true clear actually runs; an in-flight warm
+        // whose clones it destroyed must discard its partial directory.
+        private static int _clearEpoch;
 
         internal static SceneDirectoryData Cached
         {
@@ -916,10 +1034,114 @@ namespace DIYLevelFastInit
             return _cached != null && SameSets(infos, _cachedSets);
         }
 
-        internal static void Publish(SceneDirectoryData data, List<KeyValuePair<string, LevelSetInfoSO>> infos)
+        internal static void Publish(SceneDirectoryData data, List<KeyValuePair<string, LevelSetInfoSO>> infos, bool fromWarmBuild)
         {
+            if (ReferenceEquals(data, _cached))
+            {
+                // The postfix after a cache-served call re-publishes the same object.
+                return;
+            }
+            _garbageClones.AddRange(_liveClones);
+            _garbageClones.AddRange(fromWarmBuild ? _syncBuildingClones : _warmBuildingClones);
+            _liveClones = fromWarmBuild ? _warmBuildingClones : _syncBuildingClones;
+            _warmBuildingClones = new List<GameObject>();
+            _syncBuildingClones = new List<GameObject>();
             _cached = data;
             _cachedSets = new List<KeyValuePair<string, LevelSetInfoSO>>(infos);
+        }
+
+        internal static void RecordClone(GameObject clone, bool clearOnRestart)
+        {
+            if (clearOnRestart)
+            {
+                _restartClones.Add(clone);
+            }
+            else if (PseudoPrefabManager.isInCustomLevel)
+            {
+                // Level-entry builds (PseudoPrefabManager.SetAssetRef): the original
+                // destroyed these at the next blanket clear, keep that timing.
+                _ephemeralClones.Add(clone);
+            }
+            else if (_warmActive)
+            {
+                _warmBuildingClones.Add(clone);
+            }
+            else
+            {
+                _syncBuildingClones.Add(clone);
+            }
+        }
+
+        // A blanket isQuit:true clear is about to run (cache not live): bump the epoch so
+        // an in-flight warm discards entries whose clones just died.
+        internal static void OnBlanketClearRunning()
+        {
+            _clearEpoch++;
+        }
+
+        // The blanket clear was skipped because the cache is live: destroy only what
+        // nothing references anymore — superseded caches (their sessions are gone by the
+        // time StartEmptySession reaches the clear) plus the level-entry and
+        // clearOnRestart clones the original clear would have taken.
+        internal static void OnBlanketClearSkipped()
+        {
+            int destroyed = DestroyClones(_garbageClones) + DestroyClones(_ephemeralClones)
+                + DestroyClones(_restartClones);
+            _garbageClones.Clear();
+            _ephemeralClones.Clear();
+            _restartClones.Clear();
+            PruneRmLists();
+            if (destroyed > 0)
+            {
+                FastInitPlugin.Log.LogDebug("clone gc: destroyed " + destroyed + " superseded runtime prefabs");
+            }
+        }
+
+        internal static void ResetCloneTracking()
+        {
+            _liveClones.Clear();
+            _warmBuildingClones.Clear();
+            _syncBuildingClones.Clear();
+            _garbageClones.Clear();
+            _ephemeralClones.Clear();
+            _restartClones.Clear();
+        }
+
+        private static int DestroyClones(List<GameObject> clones)
+        {
+            int destroyed = 0;
+            foreach (GameObject clone in clones)
+            {
+                if (clone != null)
+                {
+                    UnityEngine.Object.DestroyImmediate(clone);
+                    destroyed++;
+                }
+            }
+            return destroyed;
+        }
+
+        // Keep RuntimePrefabManager's own lists free of entries we already destroyed, so
+        // a later original clear never DestroyImmediates a dead object.
+        private static void PruneRmLists()
+        {
+            try
+            {
+                List<GameObject> quitList = FiQuitClones.GetValue(null) as List<GameObject>;
+                if (quitList != null)
+                {
+                    quitList.RemoveAll(delegate(GameObject x) { return x == null; });
+                }
+                List<GameObject> restartList = FiRestartClones.GetValue(null) as List<GameObject>;
+                if (restartList != null)
+                {
+                    restartList.RemoveAll(delegate(GameObject x) { return x == null; });
+                }
+            }
+            catch (Exception e)
+            {
+                FastInitPlugin.Log.LogDebug("clone gc prune: " + e.Message);
+            }
         }
 
         internal static void TryStartWarm()
@@ -950,6 +1172,10 @@ namespace DIYLevelFastInit
                 {
                     yield break;
                 }
+                // A blanket isQuit:true clear (fallback path while the cache is stale)
+                // destroys clones already baked into finished entries; discard the whole
+                // build if that happens and let the finally chain rebuild.
+                int epoch = _clearEpoch;
                 PseudoPrefabSO template = FastInitPlugin.FiConfigSo.GetValue(null) as PseudoPrefabSO;
                 if (template == null)
                 {
@@ -972,6 +1198,11 @@ namespace DIYLevelFastInit
                 int index = 0;
                 while (index < levels.Count)
                 {
+                    if (epoch != _clearEpoch)
+                    {
+                        FastInitPlugin.Log.LogInfo("warm: runtime prefabs cleared mid-build, discarding partial directory");
+                        yield break;
+                    }
                     // Pause while inside a DIY level so the build never competes with
                     // scene loading; resume in the frontend.
                     while (PseudoPrefabManager.isInCustomLevel)
@@ -981,7 +1212,16 @@ namespace DIYLevelFastInit
                     float deadline = Time.realtimeSinceStartup + 0.008f;
                     while (index < levels.Count && Time.realtimeSinceStartup < deadline)
                     {
-                        SceneDirectoryData.SceneDirectoryEntry entry = BuildEntry(template, levels[index]);
+                        SceneDirectoryData.SceneDirectoryEntry entry;
+                        _warmActive = true;
+                        try
+                        {
+                            entry = BuildEntry(template, levels[index]);
+                        }
+                        finally
+                        {
+                            _warmActive = false;
+                        }
                         if (entry == null)
                         {
                             failed = true;
@@ -995,11 +1235,12 @@ namespace DIYLevelFastInit
                 }
                 data.Scenes = entries.ToArray();
                 List<KeyValuePair<string, LevelSetInfoSO>> now = DIYLevelAssetBundleManager.levelSetInfos;
-                // Publish only if the set list is unchanged since the build started and
-                // no concurrent build already published for it.
-                if (SameSets(infos, now) && !Matches(now))
+                // Publish only if the set list is unchanged since the build started, no
+                // concurrent build already published for it, and no blanket clear
+                // destroyed clones baked into the entries (the last yield is a window).
+                if (SameSets(infos, now) && !Matches(now) && epoch == _clearEpoch)
                 {
-                    Publish(data, now);
+                    Publish(data, now, true);
                     FastInitPlugin.Log.LogInfo("scene directory warmed: " + entries.Count + " levels, cache ready");
                 }
             }
