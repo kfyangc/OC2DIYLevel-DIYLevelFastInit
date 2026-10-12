@@ -18,8 +18,9 @@ namespace DIYLevelFastInit
     /// Replaces DIYLevelAssetBundleManager.Initialize(): the cheap part (common bundle,
     /// static fields, DLC data) stays synchronous, while the common* dependency bundles
     /// and all level-set info bundles load in a background coroutine. Also fixes the
-    /// original's missing idempotence guard, and adds hot sync (the menu button):
-    /// per-directory diff of levels/ that only reloads changed level sets.
+    /// original's missing idempotence guard, adds hot sync (the menu button), and caches
+    /// the scene directory so the save-dialog no longer rebuilds a level config for
+    /// every level of every set on each open.
     /// </summary>
     [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
     [BepInProcess("Overcooked2.exe")]
@@ -28,7 +29,7 @@ namespace DIYLevelFastInit
     {
         public const string PluginGuid = "oc2.diylevel.fastinit";
         public const string PluginName = "DIYLevel FastInit";
-        public const string PluginVersion = "1.4.1";
+        public const string PluginVersion = "1.5.0";
 
         internal static ManualLogSource Log;
 
@@ -37,7 +38,7 @@ namespace DIYLevelFastInit
         private static readonly FieldInfo FiCommonBundle = AccessTools.Field(typeof(DIYLevelAssetBundleManager), "commonBundle");
         private static readonly FieldInfo FiCover = AccessTools.Field(typeof(DIYLevelAssetBundleManager), "diyLevelCover");
         private static readonly FieldInfo FiSessionPrefab = AccessTools.Field(typeof(DIYLevelAssetBundleManager), "diyLevelGameSessionPrefab");
-        private static readonly FieldInfo FiConfigSo = AccessTools.Field(typeof(DIYLevelAssetBundleManager), "configTemplateSO");
+        internal static readonly FieldInfo FiConfigSo = AccessTools.Field(typeof(DIYLevelAssetBundleManager), "configTemplateSO");
         private static readonly FieldInfo FiInstance = AccessTools.Field(typeof(DIYLevelAssetBundleManager), "Instance");
         private static readonly FieldInfo FiSetMenu = AccessTools.Field(typeof(DIYLevelEntryUI), "levelSetSelectionMenu");
         private static readonly MethodInfo MiAddSetButton = AccessTools.Method(typeof(DIYLevelEntryUI), "AddLevelSetButton");
@@ -81,6 +82,21 @@ namespace DIYLevelFastInit
             else
             {
                 Log.LogWarning("AddUI heal patch not applied (member missing): menu may need re-entry to show late-loaded sets");
+            }
+            // Every save-dialog open runs StartEmptySession -> SetupSceneDirectoryData,
+            // which builds a CampaignLevelConfig for EVERY level of EVERY set (x4 player
+            // counts) on the main thread: seconds with many sets installed. Serve a
+            // cached directory instead; SceneDirectoryCache warms it in the background.
+            MethodInfo setupDirectory = AccessTools.Method(typeof(DIYLevelAssetBundleManager), "SetupSceneDirectoryData");
+            if (setupDirectory != null)
+            {
+                harmony.Patch(setupDirectory,
+                    prefix: new HarmonyMethod(typeof(FastInitPlugin), nameof(SetupDirectoryPrefix)),
+                    postfix: new HarmonyMethod(typeof(FastInitPlugin), nameof(SetupDirectoryPostfix)));
+            }
+            else
+            {
+                Log.LogWarning("SetupSceneDirectoryData not found; directory cache inactive");
             }
             Log.LogInfo("DIYLevel FastInit ready: level bundles load async, menu no longer blocks.");
         }
@@ -221,6 +237,45 @@ namespace DIYLevelFastInit
             {
                 UpdateMenuHeaderProgress(menu);
                 EnsureReloadButton(menu);
+            }
+            SceneDirectoryCache.TryStartWarm();
+        }
+
+        // Harmony prefix on DIYLevelAssetBundleManager.SetupSceneDirectoryData: serve the
+        // cached directory when the loaded level-set list is unchanged (order-sensitive:
+        // LevelId positions map into the Scenes array). Stale/missing cache falls through
+        // to the original build, whose result the postfix then captures.
+        private static bool SetupDirectoryPrefix(ref SceneDirectoryData __result)
+        {
+            try
+            {
+                List<KeyValuePair<string, LevelSetInfoSO>> infos = DIYLevelAssetBundleManager.levelSetInfos;
+                if (infos != null && infos.Count > 0 && SceneDirectoryCache.Matches(infos))
+                {
+                    __result = SceneDirectoryCache.Cached;
+                    return false;
+                }
+            }
+            catch (Exception e)
+            {
+                Log.LogDebug("SetupDirectoryPrefix: " + e.Message);
+            }
+            return true;
+        }
+
+        private static void SetupDirectoryPostfix(SceneDirectoryData __result)
+        {
+            try
+            {
+                List<KeyValuePair<string, LevelSetInfoSO>> infos = DIYLevelAssetBundleManager.levelSetInfos;
+                if (__result != null && infos != null)
+                {
+                    SceneDirectoryCache.Publish(__result, infos);
+                }
+            }
+            catch (Exception e)
+            {
+                Log.LogDebug("SetupDirectoryPostfix: " + e.Message);
             }
         }
 
@@ -832,6 +887,195 @@ namespace DIYLevelFastInit
         public DateTime InfoMtimeUtc;
         public long InfoLength;
         public DateTime DirMaxMtimeUtc;
+    }
+
+    /// <summary>
+    /// Cache for the scene directory StartEmptySession builds via
+    /// DIYLevelAssetBundleManager.SetupSceneDirectoryData. Valid as long as the loaded
+    /// level-set list is unchanged (entry-by-entry, order-sensitive); rebuilt in the
+    /// background after the initial load or a hot sync. Abandoned directories are
+    /// deliberately leaked: lingering sessions may still reference them, and destroying
+    /// the tree could take shared bundle assets down with it.
+    /// </summary>
+    internal static class SceneDirectoryCache
+    {
+        private static readonly FieldInfo FiStarBoundaries =
+            AccessTools.Field(typeof(SceneDirectoryData.PerPlayerCountDirectoryEntry), "m_PCStarBoundaries");
+
+        private static SceneDirectoryData _cached;
+        private static List<KeyValuePair<string, LevelSetInfoSO>> _cachedSets;
+        private static bool _warming;
+
+        internal static SceneDirectoryData Cached
+        {
+            get { return _cached; }
+        }
+
+        internal static bool Matches(List<KeyValuePair<string, LevelSetInfoSO>> infos)
+        {
+            return _cached != null && SameSets(infos, _cachedSets);
+        }
+
+        internal static void Publish(SceneDirectoryData data, List<KeyValuePair<string, LevelSetInfoSO>> infos)
+        {
+            _cached = data;
+            _cachedSets = new List<KeyValuePair<string, LevelSetInfoSO>>(infos);
+        }
+
+        internal static void TryStartWarm()
+        {
+            if (_warming || FastInitPlugin.Instance == null)
+            {
+                return;
+            }
+            _warming = true;
+            try
+            {
+                FastInitPlugin.Instance.StartCoroutine(WarmRoutine());
+            }
+            catch (Exception e)
+            {
+                _warming = false;
+                FastInitPlugin.Log.LogDebug("warm start: " + e.Message);
+            }
+        }
+
+        private static IEnumerator WarmRoutine()
+        {
+            bool failed = false;
+            try
+            {
+                List<KeyValuePair<string, LevelSetInfoSO>> infos = DIYLevelAssetBundleManager.levelSetInfos;
+                if (infos == null || infos.Count == 0 || Matches(infos))
+                {
+                    yield break;
+                }
+                PseudoPrefabSO template = FastInitPlugin.FiConfigSo.GetValue(null) as PseudoPrefabSO;
+                if (template == null)
+                {
+                    failed = true;
+                    FastInitPlugin.Log.LogWarning("warm: config template missing, skipping");
+                    yield break;
+                }
+                List<LevelInfoSO> levels = new List<LevelInfoSO>();
+                foreach (KeyValuePair<string, LevelSetInfoSO> kv in infos)
+                {
+                    if (kv.Value != null && kv.Value.levelInfos != null)
+                    {
+                        levels.AddRange(kv.Value.levelInfos);
+                    }
+                }
+                SceneDirectoryData data = ScriptableObject.CreateInstance<SceneDirectoryData>();
+                data.name = "DIYLevelSceneDirectory";
+                List<SceneDirectoryData.SceneDirectoryEntry> entries =
+                    new List<SceneDirectoryData.SceneDirectoryEntry>(levels.Count);
+                int index = 0;
+                while (index < levels.Count)
+                {
+                    // Pause while inside a DIY level so the build never competes with
+                    // scene loading; resume in the frontend.
+                    while (PseudoPrefabManager.isInCustomLevel)
+                    {
+                        yield return null;
+                    }
+                    float deadline = Time.realtimeSinceStartup + 0.008f;
+                    while (index < levels.Count && Time.realtimeSinceStartup < deadline)
+                    {
+                        SceneDirectoryData.SceneDirectoryEntry entry = BuildEntry(template, levels[index]);
+                        if (entry == null)
+                        {
+                            failed = true;
+                            FastInitPlugin.Log.LogWarning("warm: aborted at level " + (index + 1) + "/" + levels.Count);
+                            yield break;
+                        }
+                        entries.Add(entry);
+                        index++;
+                    }
+                    yield return null;
+                }
+                data.Scenes = entries.ToArray();
+                List<KeyValuePair<string, LevelSetInfoSO>> now = DIYLevelAssetBundleManager.levelSetInfos;
+                // Publish only if the set list is unchanged since the build started and
+                // no concurrent build already published for it.
+                if (SameSets(infos, now) && !Matches(now))
+                {
+                    Publish(data, now);
+                    FastInitPlugin.Log.LogInfo("scene directory warmed: " + entries.Count + " levels, cache ready");
+                }
+            }
+            finally
+            {
+                _warming = false;
+                // A hot sync may have changed the set list mid-build; chain a fresh
+                // warm unless we already failed (retry loops would spin forever).
+                if (!failed && !Matches(DIYLevelAssetBundleManager.levelSetInfos))
+                {
+                    TryStartWarm();
+                }
+            }
+        }
+
+        // Per-level slice of the original LevelConfigSetup.SetupSceneDirectoryData; the
+        // heavy SetupConfig itself is reused verbatim. Returns null on failure, which
+        // aborts the warm (the next dialog open then surfaces the error synchronously,
+        // exactly like the original).
+        private static SceneDirectoryData.SceneDirectoryEntry BuildEntry(PseudoPrefabSO template, LevelInfoSO info)
+        {
+            try
+            {
+                SceneDirectoryData.SceneDirectoryEntry entry = new SceneDirectoryData.SceneDirectoryEntry();
+                entry.Label = "\"" + OC2DIYLevel.UIUtils.GetLocalizedText(info.levelName, info.levelNameZH) + "\"";
+                entry.LoadScreenOverride = info.screenshot;
+                entry.AvailableInLobby = false;
+                entry.SceneVarients = new SceneDirectoryData.PerPlayerCountDirectoryEntry[4];
+                for (int playerCount = 1; playerCount <= 4; playerCount++)
+                {
+                    SceneDirectoryData.PerPlayerCountDirectoryEntry variant =
+                        new SceneDirectoryData.PerPlayerCountDirectoryEntry();
+                    variant.PlayerCount = playerCount;
+                    variant.LevelConfig = (LevelConfigBase)LevelConfigSetup.SetupConfig(template, info, playerCount);
+                    variant.SceneName = info.sceneName;
+                    variant.Screenshot = info.screenshot;
+                    LevelConfigSetupPerPlayerCountSO perCount = GetConfigPerPlayerCount(info, playerCount);
+                    FiStarBoundaries.SetValue(variant, new SceneDirectoryData.StarBoundaries
+                    {
+                        m_OneStarScore = perCount.m_OneStarScore,
+                        m_TwoStarScore = perCount.m_TwoStarScore,
+                        m_ThreeStarScore = perCount.m_ThreeStarScore,
+                        m_FourStarScore = perCount.m_FourStarScore
+                    });
+                    entry.SceneVarients[playerCount - 1] = variant;
+                }
+                return entry;
+            }
+            catch (Exception e)
+            {
+                FastInitPlugin.Log.LogWarning("warm: level [" + info.name + "] failed: " + e.Message);
+                return null;
+            }
+        }
+
+        private static LevelConfigSetupPerPlayerCountSO GetConfigPerPlayerCount(LevelInfoSO info, int playerCount)
+        {
+            return new LevelConfigSetupPerPlayerCountSO[4] { info.config_1p, info.config_2p, info.config_3p, info.config_4p }[playerCount - 1];
+        }
+
+        private static bool SameSets(List<KeyValuePair<string, LevelSetInfoSO>> a, List<KeyValuePair<string, LevelSetInfoSO>> b)
+        {
+            if (a == null || b == null || a.Count != b.Count)
+            {
+                return false;
+            }
+            for (int i = 0; i < a.Count; i++)
+            {
+                if (!string.Equals(a[i].Key, b[i].Key, StringComparison.OrdinalIgnoreCase)
+                    || !ReferenceEquals(a[i].Value, b[i].Value))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
     }
 
     internal class FastInitHost : MonoBehaviour
