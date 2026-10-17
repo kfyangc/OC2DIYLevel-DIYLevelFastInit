@@ -6,7 +6,7 @@
     <RootNamespace>DIYLevelFastInit</RootNamespace>
     <LangVersion>7.3</LangVersion>
     <!-- Keep in sync with PluginVersion in FastInitPlugin.cs -->
-    <Version>1.5.1</Version>
+    <Version>1.6.4</Version>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <DebugType>none</DebugType>
@@ -38,6 +38,10 @@
     </Reference>
     <Reference Include="UnityEngine.AssetBundleModule">
       <HintPath>$(GameDir)\Overcooked2_Data\Managed\UnityEngine.AssetBundleModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.ImageConversionModule">
+      <HintPath>$(GameDir)\Overcooked2_Data\Managed\UnityEngine.ImageConversionModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.IMGUIModule">
