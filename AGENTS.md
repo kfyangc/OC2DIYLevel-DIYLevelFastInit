@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35, single file `FastInitPlugin.cs`) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.6 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.7 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -170,6 +170,15 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   `PendingBundles` lets synchronous entry join the same native async request; never
   start a duplicate file load while that request is pending. Defer menu selection and
   thumbnail loading during a cold info request.
+- `QichiResources` prepares `qichi_assets` before any `info_qichi` container is consumed,
+  including cold discovery, source previews and both entry paths. Resolve the optional
+  Qichi runtime v10 APIs by reflection, join its existing native request or reuse the
+  resident bundle, then synchronize its request/loading/loaded fields and shared loader
+  reference. Do not start a duplicate while a request is pending. Qichi owns this bundle;
+  never add it to FastInit's info cleanup. File reading and decoding remain in Qichi's
+  runtime. The adapter covers the known info filename, not arbitrary external packages.
+  Verify a fresh-process `s_qichi_1_5` entry and its dungeon meshes/materials separately
+  from the cross-set `s_zhuzi_2` info dependency regression.
 - The reader targets UnityFS v6 / serialized-file versions 9–21 used by this Unity
   2017 game, with bounded uncompressed, LZ4 and LZMA prefix decoding. LZMA decoder
   code is an adapted public-domain SDK subset in the same source file; retain
