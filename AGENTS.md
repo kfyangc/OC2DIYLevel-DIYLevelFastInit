@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35, single file `FastInitPlugin.cs`) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.4 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.5 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -76,11 +76,20 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   boundaries, initially without heavy `LevelConfig` objects. The cached list snapshot
   is order-sensitive. Retired directories are collected at the next blanket clear.
   The 1.5.x full-directory warm build and blanket-clear suppression have been removed.
-- `OnDemandResources.LoadPrefix` intercepts both `LoadLevelServer` and
-  `LoadLevelClientPatch`. `PrepareLevel` pins the pending scene, loads its full info
-  bundle, replaces a stale session directory if necessary, and prepares the selected
-  level's four configurations before the original code consumes them. Preparing a
-  selected set is synchronous; a large set can briefly stall on first selection.
+- `OnDemandResources.ServerLoadPrefix` queues single-player/host preparation and skips
+  the immediate `LoadLevelServer` body. Yield before native work, drain active preview
+  and warmup requests, pin `_preparingBundles` across async container/info loads, then
+  build one player-count configuration per frame. Only set `_directoryBuild` around
+  each synchronous factory call, never across a yield. Replay `LoadLevelServer` once
+  through a narrowly scoped `_resumeServerLoad` guard after everything is ready.
+  Ignore duplicate server requests while `_serverPreparing`; finally paths release
+  preparation pins/progress and clear the pending scene on failure.
+- `LoadPrefix` / `PrepareLevel` remain synchronous for `LoadLevelClientPatch`.
+  OC2DIYLevel calls it from a prefix on `NetworkUtils.LevelLoadByName`; returning early
+  would let the original network handler consume incomplete session/level settings.
+  Both paths share session-directory validation and individual variant construction.
+  Do not generalize the server's asynchronous deferral to the client void method.
+  One expensive configuration and native scene activation can still cause a frame spike.
 - Public `levelSetInfos` entries remain lightweight SOs with stable identities; full
   `LoadedSet.Info` objects stay private. The directory remains complete for save IDs,
   original dependency lookup, sorting and arcade selection. Never replace it with a
@@ -120,6 +129,10 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   Pause for gameplay, transitions and uncached foreground previews. Refresh invalidates
   the warmup generation and waits for native requests to drain before changing entries.
   Cached foreground images bypass the warmup wait and cleanup queue.
+  Preview waits for warmup, cleanup and discovery must check `PreviewIsCurrent` each
+  frame. A new pending scene cancels that request; waiting unconditionally for cleanup
+  would deadlock server preparation waiting for the preview worker to drain, because
+  cleanup is deferred during transitions.
 - `ThumbnailCache` persists versioned `.thumb` files containing a source stamp, bounded
   dimensions, a SHA-256 checksum and PNG data; empty payloads record absent screenshots.
   It fingerprints all info/common source files by path, length and UTC modification time.

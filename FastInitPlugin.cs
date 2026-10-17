@@ -28,7 +28,7 @@ namespace DIYLevelFastInit
     {
         public const string PluginGuid = "oc2.diylevel.fastinit";
         public const string PluginName = "DIYLevel FastInit";
-        public const string PluginVersion = "1.6.4";
+        public const string PluginVersion = "1.6.5";
 
         internal static ManualLogSource Log;
 
@@ -105,8 +105,9 @@ namespace DIYLevelFastInit
         private void OnGUI()
         {
             bool catalogLoading = Loading && TotalSets > 0;
+            string levelLoading = OnDemandResources.LevelLoadProgress;
             bool thumbnails = OnDemandResources.WarmingThumbnails && !OnDemandResources.IsTransitioning && !PseudoPrefabManager.isInCustomLevel;
-            if (!catalogLoading && !thumbnails)
+            if (!catalogLoading && !thumbnails && levelLoading == null)
             {
                 return;
             }
@@ -121,7 +122,8 @@ namespace DIYLevelFastInit
                 }
                 List<KeyValuePair<string, LevelSetInfoSO>> infos = DIYLevelAssetBundleManager.levelSetInfos;
                 int done = (infos != null) ? infos.Count : 0;
-                string text = catalogLoading ? "DIY levels loading " + done + "/" + TotalSets
+                string text = levelLoading != null ? "DIY level preparing " + levelLoading
+                    : catalogLoading ? "DIY levels loading " + done + "/" + TotalSets
                     : "DIY previews caching " + OnDemandResources.ThumbnailDone + "/" + OnDemandResources.ThumbnailTotal;
                 Rect rect = new Rect(Screen.width - 336, 6, 330, 26);
                 _progressStyle.normal.textColor = Color.black;
@@ -1269,6 +1271,9 @@ namespace DIYLevelFastInit
         private static bool _previewLoading, _warmRunning, _warmLoading, _warmQueued, _thumbnailAdapter;
         private static int _warmGeneration;
         private static HashSet<string> _warmBundles;
+        private static HashSet<string> _preparingBundles;
+        private static bool _serverPreparing, _resumeServerLoad;
+        internal static string LevelLoadProgress;
         private static float _lastPreviewTime;
         internal static int ThumbnailDone, ThumbnailTotal;
         internal static bool WarmingThumbnails { get { return _warmRunning; } }
@@ -1284,7 +1289,7 @@ namespace DIYLevelFastInit
 
         internal static void Install(Harmony harmony)
         {
-            Patch(harmony, typeof(DIYLevelAssetBundleManager), "LoadLevelServer", nameof(LoadPrefix), null);
+            Patch(harmony, typeof(DIYLevelAssetBundleManager), "LoadLevelServer", nameof(ServerLoadPrefix), null);
             Patch(harmony, typeof(DIYLevelAssetBundleManager), "LoadLevelClientPatch", nameof(LoadPrefix), null);
             Patch(harmony, typeof(DIYLevelEntryUI), "OnLevelSelected", nameof(SelectionPrefix), null);
             Patch(harmony, typeof(RuntimePrefabManager), "ClearAllRuntimePrefabs", nameof(ClearPrefix), null);
@@ -1374,10 +1379,11 @@ namespace DIYLevelFastInit
                     _previewLoading = true;
                     try
                     {
-                        while (_warmLoading) yield return null;
+                        while (_warmLoading && PreviewIsCurrent(request)) yield return null;
+                        if (!PreviewIsCurrent(request)) continue;
                         ReleaseUnused();
-                        yield return WaitForCleanup();
-                        while (_catalogBundles != null) yield return null;
+                        while (_cleanupQueued && PreviewIsCurrent(request)) yield return null;
+                        while (_catalogBundles != null && PreviewIsCurrent(request)) yield return null;
                         if (!PreviewIsCurrent(request)) continue;
                         yield return FastInitHost.Guard(LoadPreview(request), "thumbnail " + Path.GetFileName(request.Path));
                     }
@@ -1496,7 +1502,7 @@ namespace DIYLevelFastInit
             }
             try
             {
-                yield return FastInitHost.WaitOp(request, "thumbnail info " + Path.GetFileName(path));
+                yield return FastInitHost.WaitOp(request, "info " + Path.GetFileName(path));
                 result.Value = request.asset as LevelSetInfoSO;
                 if (result.Value == null) throw new IOException("Missing LevelSetInfo: " + path);
             }
@@ -1717,11 +1723,11 @@ namespace DIYLevelFastInit
             }
         }
 
-        private static LevelInfoSO Resolve(LevelInfoSO catalog, string path)
+        private static LevelInfoSO Resolve(string path, string scene)
         {
             foreach (LevelInfoSO info in LoadSet(path).Info.levelInfos)
-                if (string.Equals(info.sceneName, catalog.sceneName, StringComparison.OrdinalIgnoreCase)) return info;
-            throw new IOException("Level no longer in info bundle; refresh the catalog: " + catalog.sceneName);
+                if (string.Equals(info.sceneName, scene, StringComparison.OrdinalIgnoreCase)) return info;
+            throw new IOException("Level no longer in info bundle; refresh the catalog: " + scene);
         }
 
         private static void LoadPrefix(string sceneName)
@@ -1737,26 +1743,118 @@ namespace DIYLevelFastInit
             }
         }
 
-        private static bool SelectionPrefix() { return !FastInitPlugin.Syncing && _catalogBundles == null; }
+        private static bool ServerLoadPrefix(string sceneName)
+        {
+            if (_resumeServerLoad) return true;
+            if (FastInitPlugin.Syncing) throw new InvalidOperationException("DIY catalog refresh is in progress; retry after it completes");
+            if (_serverPreparing)
+            {
+                FastInitPlugin.Log.LogDebug("DIY level preparation already pending; ignoring duplicate load: " + sceneName);
+                return false;
+            }
+            if (FastInitPlugin.Instance == null) { LoadPrefix(sceneName); return true; }
+            string path = FindScenePath(sceneName);
+            _pendingScene = sceneName;
+            _serverPreparing = true;
+            LevelLoadProgress = "...";
+            FastInitPlugin.Instance.StartCoroutine(FastInitHost.Guard(PrepareServerLevel(path, sceneName), "DIY level preparation [" + sceneName + "]"));
+            return false;
+        }
+
+        private static IEnumerator PrepareServerLevel(string path, string scene)
+        {
+            bool resumed = false;
+            System.Diagnostics.Stopwatch timer = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                yield return null;
+                FastInitPlugin.Log.LogInfo("async level preparation started: " + scene);
+                CancelPreview();
+                ThumbnailCache.ClearMemory();
+                while (_warmLoading || _previewLoading || _catalogBundles != null) yield return null;
+                ReleaseUnused();
+                List<FileInfo> files = FastInitHost.SafeGetFiles(new DirectoryInfo(path), "info*");
+                if (files.Count == 0) throw new FileNotFoundException("Missing info bundle", path);
+                _preparingBundles = InfoBundleGraph.Required(files[0].FullName, Path.Combine(path, scene));
+                foreach (string required in _preparingBundles) yield return EnsureInfoBundleAsync(required, 10);
+                LoadedSet set;
+                if (!Sets.TryGetValue(path, out set))
+                {
+                    Box<LevelSetInfoSO> info = new Box<LevelSetInfoSO>();
+                    try
+                    {
+                        AssetBundle bundle = InfoBundles[files[0].FullName];
+                        yield return EnsureInfoAssetAsync(path, bundle, info, 10);
+                        set = new LoadedSet { Bundle = bundle, Info = info.Value };
+                        set.Required.UnionWith(InfoBundleGraph.Required(files[0].FullName, null));
+                        Sets.Add(path, set);
+                        FastInitPlugin.Log.LogInfo("on-demand info loaded: " + Path.GetFileName(path) + " (" + InfoBundles.Count + " bundles tracked, async level entry)");
+                    }
+                    finally { info.Value = null; }
+                }
+                set.SceneDependencies[scene] = _preparingBundles;
+                FastInitPlugin.Log.LogInfo("async level resources ready: " + scene + " (" + timer.ElapsedMilliseconds + " ms elapsed)");
+                LevelLoadProgress = "0/4";
+                LevelInfoSO full = Resolve(path, scene);
+                SceneDirectoryData.SceneDirectoryEntry entry = PrepareSessionEntry(scene);
+                entry.LoadScreenOverride = full.screenshot;
+                for (int i = 0; i < entry.SceneVarients.Length; i++)
+                {
+                    System.Diagnostics.Stopwatch configTimer = System.Diagnostics.Stopwatch.StartNew();
+                    PrepareVariant(full, entry.SceneVarients[i]);
+                    LevelLoadProgress = (i + 1) + "/" + entry.SceneVarients.Length;
+                    string timing = "level config prepared: " + scene + " (" + (i + 1) + "p, " + configTimer.ElapsedMilliseconds + " ms)";
+                    if (configTimer.ElapsedMilliseconds >= 50) FastInitPlugin.Log.LogInfo(timing);
+                    else FastInitPlugin.Log.LogDebug(timing);
+                    yield return null;
+                }
+                FastInitPlugin.Log.LogInfo("on-demand config ready: " + scene + " (" + Levels.Count + " levels retained, async level entry, " + timer.ElapsedMilliseconds + " ms elapsed)");
+                try
+                {
+                    _resumeServerLoad = true;
+                    DIYLevelAssetBundleManager.LoadLevelServer(scene);
+                    resumed = true;
+                }
+                finally { _resumeServerLoad = false; }
+            }
+            finally
+            {
+                LevelLoadProgress = null;
+                _serverPreparing = false;
+                _preparingBundles = null;
+                if (!resumed) _pendingScene = null;
+                ReleaseUnused();
+            }
+        }
+
+        private static bool SelectionPrefix() { return !FastInitPlugin.Syncing && !IsTransitioning && _catalogBundles == null; }
+
+        private static string FindScenePath(string scene)
+        {
+            foreach (KeyValuePair<string, LevelSetInfoSO> set in DIYLevelAssetBundleManager.levelSetInfos)
+                foreach (LevelInfoSO info in set.Value.levelInfos)
+                    if (string.Equals(info.sceneName, scene, StringComparison.OrdinalIgnoreCase))
+                        return set.Key;
+            throw new InvalidOperationException("DIY level not found in catalog: " + scene);
+        }
 
         private static void PrepareLevel(string scene)
         {
-            string path = null;
-            LevelInfoSO catalog = null;
-            foreach (KeyValuePair<string, LevelSetInfoSO> set in DIYLevelAssetBundleManager.levelSetInfos)
-            {
-                foreach (LevelInfoSO info in set.Value.levelInfos)
-                    if (string.Equals(info.sceneName, scene, StringComparison.OrdinalIgnoreCase))
-                    { catalog = info; path = set.Key; break; }
-                if (catalog != null) break;
-            }
-            if (catalog == null) throw new InvalidOperationException("DIY level not found in catalog: " + scene);
+            string path = FindScenePath(scene);
             _pendingScene = scene;
             CancelPreview();
             ThumbnailCache.ClearMemory();
             ReleaseUnused();
             LoadSet(path, scene);
-            LevelInfoSO full = Resolve(catalog, path);
+            LevelInfoSO full = Resolve(path, scene);
+            SceneDirectoryData.SceneDirectoryEntry entry = PrepareSessionEntry(scene);
+            entry.LoadScreenOverride = full.screenshot;
+            foreach (SceneDirectoryData.PerPlayerCountDirectoryEntry variant in entry.SceneVarients) PrepareVariant(full, variant);
+            FastInitPlugin.Log.LogInfo("on-demand config ready: " + scene + " (" + Levels.Count + " levels retained)");
+        }
+
+        private static SceneDirectoryData.SceneDirectoryEntry PrepareSessionEntry(string scene)
+        {
             SceneDirectoryData directory = SceneDirectoryCache.GetDirectory();
             GameSession session = GameUtils.GetGameSession();
             if (session == null || session.DLC != 15 || !ReferenceEquals(session.Progress.GetSceneDirectory(), directory))
@@ -1764,30 +1862,28 @@ namespace DIYLevelFastInit
             foreach (SceneDirectoryData.SceneDirectoryEntry entry in directory.Scenes)
             {
                 if (!string.Equals(entry.SceneVarients[0].SceneName, scene, StringComparison.OrdinalIgnoreCase)) continue;
-                PseudoPrefabSO template = FastInitPlugin.FiConfigSo.GetValue(null) as PseudoPrefabSO;
-                entry.LoadScreenOverride = full.screenshot;
-                _directoryBuild = true;
-                try
-                {
-                    foreach (SceneDirectoryData.PerPlayerCountDirectoryEntry variant in entry.SceneVarients)
-                    {
-                        if (variant.LevelConfig == null)
-                            variant.LevelConfig = LevelConfigSetup.SetupConfig(template, full, variant.PlayerCount);
-                        variant.Screenshot = full.screenshot;
-                    }
-                }
-                finally { _directoryBuild = false; }
-                FastInitPlugin.Log.LogInfo("on-demand config ready: " + scene + " (" + Levels.Count + " levels retained)");
-                return;
+                return entry;
             }
             throw new InvalidOperationException("Missing scene directory entry: " + scene);
+        }
+
+        private static void PrepareVariant(LevelInfoSO full, SceneDirectoryData.PerPlayerCountDirectoryEntry variant)
+        {
+            _directoryBuild = true;
+            try
+            {
+                if (variant.LevelConfig == null)
+                    variant.LevelConfig = LevelConfigSetup.SetupConfig(FastInitPlugin.FiConfigSo.GetValue(null) as PseudoPrefabSO, full, variant.PlayerCount);
+                variant.Screenshot = full.screenshot;
+            }
+            finally { _directoryBuild = false; }
         }
 
         private static void ConfigPrefix(ref LevelInfoSO config, ref string __state)
         {
             __state = _buildingScene;
             string path;
-            if (FindCatalogLevel(config, out path)) config = Resolve(config, path);
+            if (FindCatalogLevel(config, out path)) config = Resolve(path, config.sceneName);
             _buildingScene = config.sceneName;
         }
 
@@ -1985,6 +2081,7 @@ namespace DIYLevelFastInit
             if (_catalogBundles != null) retained.UnionWith(_catalogBundles);
             if (_previewBundles != null) retained.UnionWith(_previewBundles);
             if (_warmBundles != null) retained.UnionWith(_warmBundles);
+            if (_preparingBundles != null) retained.UnionWith(_preparingBundles);
             foreach (LoadedSet set in Sets.Values)
             {
                 retained.UnionWith(set.Required);
