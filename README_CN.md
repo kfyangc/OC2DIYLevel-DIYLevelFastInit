@@ -4,7 +4,7 @@
 
 [English README](README.md)
 
-## 1.6.2 的行为
+## 1.6.3 的行为
 
 此前的异步加载消除了主菜单的长时间冻结，但全部 `info_*` 资源和所有关卡的四套人数配置仍然常驻。对于 32 位游戏，启动快并不等于内存占用低。
 
@@ -16,7 +16,7 @@
 - **目标关卡配置**：房主或客户端收到目标关卡后，准备该关卡的四套人数配置。其他关卡不预热。重开同关可复用目录配置。
 - **跨关卡集依赖**：读取场景和 info 的资源引用元数据，递归加载它们实际依赖的其他 info 包，修复只加载自身 info 时跨关卡集材质丢失的问题。依赖包只打开容器，不额外读取其 `LevelSetInfo` 或生成关卡配置；共享依赖保留到最后一个使用者退出。只读元数据解析内置在 DLL 中，无需 Python 或额外插件。
 - **资源回收**：按场景是否仍在使用决定何时释放 info、配置和运行时 prefab。info 包解除引用并 `Unload(false)` 后，合并清理请求，在前端由 `Resources.UnloadUnusedAssets()` 回收无引用对象，保留仍被使用的材质和 Shader；不在 DIY 关卡或切图中主动启动这项清理。切图允许新旧资源短暂重叠；每次重开产生的场景运行时对象按场景实例回收。
-- **缩略图**：内置对 OC2StageThumbnailPreview 1.0.0 的适配，聚焦某关时按需读取其所在关卡集，切换到其他关卡集时释放旧预览资源。排序插件仍使用原有的轻量 SO 对象。
+- **缩略图**：内置对 OC2StageThumbnailPreview 1.0.0 的异步适配。打开关卡集后菜单先显示，图片随后加载，避免在菜单回调中同步读取整个 info 造成数秒冻结。快速切换时合并请求，只显示最新选中的图片；旧请求等待完成后释放，不会覆盖新图片。仅保留一个预览关卡集，排序插件仍使用原有的轻量 SO 对象。
 - **热刷新**：保留“刷新关卡列表”，只更新有变化的目录；正在切图或关卡内不刷新。刷新过程中禁止选关。
 - **异步请求**：15 秒未完成时记录等待提示，继续等待同一个请求；仅在请求已经完成且失败后同步重试，避免无法取消的旧请求与新请求争抢同一个包。
 
@@ -49,6 +49,7 @@ dotnet build -c Release -p:GameDir="D:\Games\Steam Games\steamapps\common\Overco
 - `lightweight scene directory: ... no recipe configs`：存档界面未全量生成配置。
 - `on-demand info loaded/released`：当前跟踪的包数量，不能据此推断所有旧资源已立即回收。
 - `info dependency graph`、`info dependency released`：目标场景需要的 info 包及共享依赖的释放。
+- `on-demand preview info loaded`、`thumbnail ready (... async ... ms elapsed)`：异步预览完成；耗时包含该次加载的异步等待时间，不代表主线程冻结时间。
 - `on-demand config ready/released`、`scene runtime objects released`：目标配置与每次场景实例的回收。
 - `scene material audit`、`scene material invalid`：进入 DIY 场景后对材质 Shader 引用与支持状态做一次只读检查；不会自动替换材质。
 

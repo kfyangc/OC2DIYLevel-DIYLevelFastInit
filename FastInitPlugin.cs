@@ -28,7 +28,7 @@ namespace DIYLevelFastInit
     {
         public const string PluginGuid = "oc2.diylevel.fastinit";
         public const string PluginName = "DIYLevel FastInit";
-        public const string PluginVersion = "1.6.2";
+        public const string PluginVersion = "1.6.3";
 
         internal static ManualLogSource Log;
 
@@ -289,6 +289,7 @@ namespace DIYLevelFastInit
             {
                 Log.LogInfo("sync started");
                 OnDemandResources.ResetFrontend();
+                yield return OnDemandResources.WaitForPreview();
                 List<DirectoryInfo> dirs = FastInitHost.SafeGetDirs(Path.Combine(GetDiyPluginDir(), "levels"));
                 TotalSets = dirs.Count;
                 if (dirs.Count == 0 && DIYLevelAssetBundleManager.levelSetInfos != null
@@ -1245,10 +1246,23 @@ namespace DIYLevelFastInit
             internal readonly HashSet<UnityEngine.Object> Objects = new HashSet<UnityEngine.Object>();
         }
 
+        private sealed class PreviewRequest
+        {
+            internal Image Image;
+            internal LevelInfoSO Level;
+            internal string Path;
+            internal bool Started;
+        }
+
         private static readonly Dictionary<string, LoadedSet> Sets = new Dictionary<string, LoadedSet>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<string, AssetBundle> InfoBundles = new Dictionary<string, AssetBundle>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<string, AssetBundleCreateRequest> PendingBundles = new Dictionary<string, AssetBundleCreateRequest>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, AssetBundleRequest> PendingInfos = new Dictionary<string, AssetBundleRequest>(StringComparer.OrdinalIgnoreCase);
         private static HashSet<string> _catalogBundles;
+        private static HashSet<string> _previewBundles;
+        private static PreviewRequest _previewRequest;
+        private static bool _previewRunning;
+        private static float _lastPreviewTime;
         private static readonly Dictionary<string, LevelResources> Levels = new Dictionary<string, LevelResources>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<Scene, LevelResources> SceneObjects = new Dictionary<Scene, LevelResources>();
         private static readonly FieldInfo QuitClones = AccessTools.Field(typeof(RuntimePrefabManager), "runtimePrefabsClearOnQuit");
@@ -1295,25 +1309,136 @@ namespace DIYLevelFastInit
             MethodInfo method = AccessTools.Method(type, "UpdatePreview", new[] { typeof(Image), typeof(LevelInfoSO) });
             if (method == null) return;
             harmony.Patch(method, prefix: new HarmonyMethod(typeof(OnDemandResources), nameof(PreviewPrefix)));
-            FastInitPlugin.Log.LogInfo("on-demand thumbnails: StageThumbnailPreview adapter installed");
+            FastInitPlugin.Log.LogInfo("on-demand thumbnails: asynchronous StageThumbnailPreview adapter installed");
         }
 
-        private static void PreviewPrefix(LevelInfoSO level)
+        private static void PreviewPrefix(Image __0, LevelInfoSO level)
         {
-            if (level == null || FastInitPlugin.Syncing || _catalogBundles != null || IsTransitioning || PseudoPrefabManager.isInCustomLevel) return;
+            if (__0 == null) return;
+            if (level == null)
+            {
+                if (_previewRequest != null && ReferenceEquals(_previewRequest.Image, __0)) _previewRequest = null;
+                return;
+            }
+            if (FastInitPlugin.Syncing || IsTransitioning || PseudoPrefabManager.isInCustomLevel) return;
+            string path;
+            if (!FindCatalogLevel(level, out path)) return;
+            if (_previewRequest != null && ReferenceEquals(_previewRequest.Image, __0)
+                && ReferenceEquals(_previewRequest.Level, level)) return;
+            _previewRequest = new PreviewRequest { Image = __0, Level = level, Path = path };
+            _previewPath = path;
+            _lastPreviewTime = Time.realtimeSinceStartup;
+            if (_previewRunning || FastInitPlugin.Instance == null) return;
+            _previewRunning = true;
+            FastInitPlugin.Instance.StartCoroutine(FastInitHost.Guard(PreviewRoutine(), "thumbnail queue"));
+        }
+
+        private static bool PreviewIsCurrent(PreviewRequest request)
+        {
+            return ReferenceEquals(_previewRequest, request) && request.Image != null && request.Level != null
+                && request.Image.transform.parent != null && request.Image.transform.parent.gameObject.activeInHierarchy
+                && !FastInitPlugin.Syncing && !IsTransitioning && !PseudoPrefabManager.isInCustomLevel;
+        }
+
+        private static IEnumerator PreviewRoutine()
+        {
             try
             {
-                string path;
-                if (!FindCatalogLevel(level, out path)) return;
-                _previewPath = path;
-                ReleaseUnused();
-                LevelInfoSO full = Resolve(level, path);
-                level.screenshot = full.screenshot;
+                while (_previewRequest != null)
+                {
+                    yield return null;
+                    PreviewRequest request = _previewRequest;
+                    if (request == null) break;
+                    if (!PreviewIsCurrent(request))
+                    {
+                        _previewRequest = null;
+                        break;
+                    }
+                    if (request.Started) continue;
+                    if (_catalogBundles != null) continue;
+                    request.Started = true;
+                    ReleaseUnused();
+                    yield return WaitForCleanup();
+                    while (_catalogBundles != null) yield return null;
+                    if (!PreviewIsCurrent(request)) continue;
+                    yield return FastInitHost.Guard(LoadPreview(request), "thumbnail " + Path.GetFileName(request.Path));
+                }
             }
-            catch (Exception e)
+            finally
             {
-                FastInitPlugin.Log.LogWarning("thumbnail unavailable: " + e.Message);
+                _previewRunning = false;
+                _previewBundles = null;
+                ReleaseUnused();
             }
+        }
+
+        private static IEnumerator LoadPreview(PreviewRequest request)
+        {
+            System.Diagnostics.Stopwatch timer = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                LoadedSet set;
+                if (!Sets.TryGetValue(request.Path, out set))
+                {
+                    List<FileInfo> files = FastInitHost.SafeGetFiles(new DirectoryInfo(request.Path), "info*");
+                    if (files.Count == 0) throw new FileNotFoundException("Missing info bundle", request.Path);
+                    _previewBundles = InfoBundleGraph.Required(files[0].FullName, null);
+                    ReleaseUnused();
+                    foreach (string path in _previewBundles)
+                    {
+                        if (!PreviewIsCurrent(request)) yield break;
+                        yield return EnsureInfoBundleAsync(path);
+                    }
+                    if (!PreviewIsCurrent(request)) yield break;
+                    if (!Sets.TryGetValue(request.Path, out set))
+                    {
+                        AssetBundle bundle = InfoBundles[files[0].FullName];
+                        AssetBundleRequest asset = bundle.LoadAssetAsync("LevelSetInfo", typeof(LevelSetInfoSO));
+                        PendingInfos.Add(request.Path, asset);
+                        try
+                        {
+                            yield return FastInitHost.WaitOp(asset, "thumbnail info " + Path.GetFileName(request.Path));
+                            if (!PreviewIsCurrent(request)) yield break;
+                            if (!Sets.TryGetValue(request.Path, out set))
+                            {
+                                LevelSetInfoSO info = asset.asset as LevelSetInfoSO;
+                                if (info == null) throw new IOException("Missing LevelSetInfo: " + request.Path);
+                                set = new LoadedSet { Bundle = bundle, Info = info };
+                                set.Required.UnionWith(_previewBundles);
+                                Sets.Add(request.Path, set);
+                                FastInitPlugin.Log.LogInfo("on-demand preview info loaded: " + Path.GetFileName(request.Path)
+                                    + " (" + InfoBundles.Count + " bundles tracked)");
+                            }
+                        }
+                        finally { PendingInfos.Remove(request.Path); }
+                    }
+                }
+                if (!PreviewIsCurrent(request)) yield break;
+                LevelInfoSO full = null;
+                foreach (LevelInfoSO level in set.Info.levelInfos)
+                    if (string.Equals(level.sceneName, request.Level.sceneName, StringComparison.OrdinalIgnoreCase)) { full = level; break; }
+                if (full == null) throw new IOException("Level no longer in preview info: " + request.Level.sceneName);
+                request.Level.screenshot = full.screenshot;
+                request.Image.sprite = full.screenshot;
+                request.Image.gameObject.SetActive(full.screenshot != null);
+                FastInitPlugin.Log.LogInfo("thumbnail ready: " + request.Level.sceneName + " (async, " + timer.ElapsedMilliseconds + " ms elapsed)");
+            }
+            finally
+            {
+                _previewBundles = null;
+                ReleaseUnused();
+            }
+        }
+
+        private static void CancelPreview()
+        {
+            _previewRequest = null;
+            _previewPath = null;
+        }
+
+        internal static IEnumerator WaitForPreview()
+        {
+            while (_previewRunning) yield return null;
         }
 
         private static bool FindCatalogLevel(LevelInfoSO level, out string path)
@@ -1331,18 +1456,30 @@ namespace DIYLevelFastInit
         {
             _catalogBundles = InfoBundleGraph.Required(path, null);
             foreach (string required in _catalogBundles)
-            {
-                if (InfoBundles.ContainsKey(required)) continue;
-                AssetBundleCreateRequest request = AssetBundle.LoadFromFileAsync(required);
-                PendingBundles.Add(required, request);
-                try
-                {
-                    yield return FastInitHost.WaitOp(request, Path.GetFileName(required));
-                    GetInfoBundle(required);
-                }
-                finally { PendingBundles.Remove(required); }
-            }
+                yield return EnsureInfoBundleAsync(required);
             result.Value = InfoBundles[path];
+        }
+
+        private static IEnumerator EnsureInfoBundleAsync(string path)
+        {
+            if (InfoBundles.ContainsKey(path)) yield break;
+            AssetBundleCreateRequest request;
+            if (!PendingBundles.TryGetValue(path, out request))
+            {
+                request = AssetBundle.LoadFromFileAsync(path);
+                PendingBundles.Add(path, request);
+            }
+            try
+            {
+                yield return FastInitHost.WaitOp(request, Path.GetFileName(path));
+                GetInfoBundle(path);
+            }
+            finally
+            {
+                AssetBundleCreateRequest pending;
+                if (request.isDone && PendingBundles.TryGetValue(path, out pending) && ReferenceEquals(pending, request))
+                    PendingBundles.Remove(path);
+            }
         }
 
         internal static void ReleaseCatalogBundle()
@@ -1383,7 +1520,9 @@ namespace DIYLevelFastInit
                     return loaded;
                 }
                 AssetBundle bundle = InfoBundles[files[0].FullName];
-                LevelSetInfoSO info = bundle.LoadAsset<LevelSetInfoSO>("LevelSetInfo");
+                AssetBundleRequest pending;
+                LevelSetInfoSO info = PendingInfos.TryGetValue(path, out pending)
+                    ? pending.asset as LevelSetInfoSO : bundle.LoadAsset<LevelSetInfoSO>("LevelSetInfo");
                 if (info == null) throw new IOException("Missing LevelSetInfo: " + path);
                 loaded = new LoadedSet { Bundle = bundle, Info = info };
                 loaded.Required.UnionWith(scene == null ? required : InfoBundleGraph.Required(files[0].FullName, null));
@@ -1434,7 +1573,7 @@ namespace DIYLevelFastInit
             }
             if (catalog == null) throw new InvalidOperationException("DIY level not found in catalog: " + scene);
             _pendingScene = scene;
-            _previewPath = null;
+            CancelPreview();
             ReleaseUnused();
             LoadSet(path, scene);
             LevelInfoSO full = Resolve(catalog, path);
@@ -1552,7 +1691,7 @@ namespace DIYLevelFastInit
             if (frontend || string.Equals(scene.name, _pendingScene, StringComparison.OrdinalIgnoreCase))
             {
                 _pendingScene = null;
-                _previewPath = null;
+                CancelPreview();
             }
             ReleaseUnused();
             if (frontend) RequestCleanup();
@@ -1589,7 +1728,8 @@ namespace DIYLevelFastInit
                 while (_cleanupRequested)
                 {
                     yield return null;
-                    while (IsTransitioning || PseudoPrefabManager.isInCustomLevel) yield return null;
+                    while (IsTransitioning || PseudoPrefabManager.isInCustomLevel || _previewBundles != null
+                        || Time.realtimeSinceStartup - _lastPreviewTime < 0.5f) yield return null;
                     _cleanupRequested = false;
                     yield return Resources.UnloadUnusedAssets();
                     FastInitPlugin.Log.LogDebug("unused info assets collected; referenced assets preserved");
@@ -1639,7 +1779,7 @@ namespace DIYLevelFastInit
 
         internal static void ResetFrontend()
         {
-            _previewPath = null;
+            CancelPreview();
             ReleaseUnused();
         }
 
@@ -1661,6 +1801,7 @@ namespace DIYLevelFastInit
             }
             HashSet<string> retained = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (_catalogBundles != null) retained.UnionWith(_catalogBundles);
+            if (_previewBundles != null) retained.UnionWith(_previewBundles);
             foreach (LoadedSet set in Sets.Values)
             {
                 retained.UnionWith(set.Required);

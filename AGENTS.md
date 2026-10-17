@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35, single file `FastInitPlugin.cs`) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.2 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.3 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -101,6 +101,17 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   The optional `OC2StageThumbnailPreview.Patches.PreviewController.UpdatePreview(Image,
   LevelInfoSO)` adapter is installed in `Start`, loading screenshots on demand while
   retaining at most one preview set. Returning to the frontend can trigger a new preview.
+- The thumbnail prefix must only queue a request and return; never call `Resolve`,
+  synchronous `LoadSet`, `LoadFromFile`, or `LoadAsset` from the menu callback.
+  `PreviewRoutine` coalesces focus changes into the latest image/level request and
+  starts work after yielding a frame. `LoadPreview` uses async bundle and info requests,
+  pins `_previewBundles` until every native request finishes, and only applies an image
+  if its request is still current and the menu hierarchy is active. Stale requests are
+  drained and released rather than cancelled or allowed to overwrite a newer image.
+  Drain queued unused-asset collection before starting the next preview, so sustained
+  browsing cannot accumulate detached asset graphs behind an always-busy worker.
+  `PendingInfos` lets actual level entry join the same native info request. Refresh
+  cancels the preview selection and waits for its worker to drain before mutating sets.
 - `InfoBundleGraph` indexes serialized CAB names from info bundle directory tables,
   then reads only serialized metadata prefixes to find external CAB references in the
   selected scene and info files. Follow the transitive closure, including cycles.
@@ -124,7 +135,8 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
 - Cleanup requests are coalesced by `RequestCleanup` / `CleanupRoutine`. After yielding
   a frame, wait until neither a transition nor DIY gameplay is active, then let
   `Resources.UnloadUnusedAssets()` reclaim unreferenced assets. Cold discovery waits
-  for this cleanup before consuming the next source bundle. Tracked bundle counts do
+  for this cleanup before consuming the next source bundle. Also defer collection while
+  a preview is loading and for 0.5 seconds after a focus change. Tracked bundle counts do
   not count detached assets awaiting collection.
 - `AuditSceneMaterials` checks active renderers two frames after DIY scene entry. It
   logs material/shader names and support status, warning on empty mesh material slots,
@@ -185,6 +197,10 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   the scene-instance dictionary key.
 
 ## Publishing rule
+
+Commit each version independently after implementation and relevant checks, before
+starting the next version. Include the version number in the commit message and keep
+`PluginVersion` and the csproj version synchronized, preserving development history.
 
 Creating the GitHub repo, pushing, or cutting releases requires the owner's explicit
 review and approval first — never push on your own initiative.
