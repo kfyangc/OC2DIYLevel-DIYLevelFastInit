@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35, single file `FastInitPlugin.cs`) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.3 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.4 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -94,13 +94,13 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   behavior. Track only objects created by these factories: SetupConfig clones the first
   round's recipe list, while other rounds may still reference shared assets.
 - Info bundles stay loaded while a related scene is loaded, is the pending target, or
-  is the current preview set. `ReleaseUnused` clears catalog screenshot references and
+  is the current uncached preview set. `ReleaseUnused` clears catalog screenshot references and
   closes unneeded info bundles with `Unload(false)` after clearing full-info references.
   Do not force-destroy info assets with `Unload(true)`: other materials or scenes can
   still reference them. New and old resources may overlap during transitions.
   The optional `OC2StageThumbnailPreview.Patches.PreviewController.UpdatePreview(Image,
-  LevelInfoSO)` adapter is installed in `Start`, loading screenshots on demand while
-  retaining at most one preview set. Returning to the frontend can trigger a new preview.
+  LevelInfoSO)` adapter is installed in `Start`. Cached previews use private copied
+  sprites; an uncached preview temporarily retains at most one source set.
 - The thumbnail prefix must only queue a request and return; never call `Resolve`,
   synchronous `LoadSet`, `LoadFromFile`, or `LoadAsset` from the menu callback.
   `PreviewRoutine` coalesces focus changes into the latest image/level request and
@@ -112,6 +112,26 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   browsing cannot accumulate detached asset graphs behind an always-busy worker.
   `PendingInfos` lets actual level entry join the same native info request. Refresh
   cancels the preview selection and waits for its worker to drain before mutating sets.
+- With the optional thumbnail adapter installed, `FinishLoading` queues sequential
+  thumbnail prewarming over the complete catalog, without requiring menu visits.
+  Pin `_warmBundles` while native requests run; keep full `LevelSetInfo` only in the
+  current worker, write one copied image per frame, drain the bounded disk writer,
+  release source references and wait for unused-asset collection before the next set.
+  Pause for gameplay, transitions and uncached foreground previews. Refresh invalidates
+  the warmup generation and waits for native requests to drain before changing entries.
+  Cached foreground images bypass the warmup wait and cleanup queue.
+- `ThumbnailCache` persists versioned `.thumb` files containing a source stamp, bounded
+  dimensions, a SHA-256 checksum and PNG data; empty payloads record absent screenshots.
+  It fingerprints all info/common source files by path, length and UTC modification time.
+  Invalidate the stamp on catalog completion/refresh; source changes conservatively
+  invalidate all thumbnails. Header-only readiness checks avoid decoding during warmup;
+  actual reads verify the full payload and fall back to async loading on corruption.
+  GPU copies handle non-readable source textures and shrink to at most 640 x 360.
+  Keep copied sprites private to the preview adapter: never assign them to public
+  catalog SOs or scene-directory screenshots, which may outlive LRU eviction.
+  Keep at most eight decoded images; clear them at level entry. The single disk writer
+  has a four-item queue, atomic replacement and a 128 MiB oldest-entry eviction limit.
+  Warmup observes writer backpressure. Workers never call Unity APIs off the main thread.
 - `InfoBundleGraph` indexes serialized CAB names from info bundle directory tables,
   then reads only serialized metadata prefixes to find external CAB references in the
   selected scene and info files. Follow the transitive closure, including cycles.
@@ -183,7 +203,8 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
 ## Build gotchas
 
 - The `UnityEngine.dll` facade alone is not enough: module references
-  (CoreModule, AssetBundleModule, IMGUIModule, TextRenderingModule, UnityEngine.UI) are required.
+  (CoreModule, AssetBundleModule, ImageConversionModule, IMGUIModule, TextRenderingModule,
+  UnityEngine.UI) are required. ImageConversionModule provides PNG encode/decode.
 - The game has a global-namespace `UIUtils` that shadows `OC2DIYLevel.UIUtils` — fully
   qualify the latter.
 - `[BepInDependency]` with the two-argument enum fails to resolve; use the single-argument

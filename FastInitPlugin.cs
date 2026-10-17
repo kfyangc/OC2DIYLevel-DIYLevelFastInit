@@ -28,7 +28,7 @@ namespace DIYLevelFastInit
     {
         public const string PluginGuid = "oc2.diylevel.fastinit";
         public const string PluginName = "DIYLevel FastInit";
-        public const string PluginVersion = "1.6.3";
+        public const string PluginVersion = "1.6.4";
 
         internal static ManualLogSource Log;
 
@@ -104,7 +104,9 @@ namespace DIYLevelFastInit
 
         private void OnGUI()
         {
-            if (!Loading || TotalSets <= 0)
+            bool catalogLoading = Loading && TotalSets > 0;
+            bool thumbnails = OnDemandResources.WarmingThumbnails && !OnDemandResources.IsTransitioning && !PseudoPrefabManager.isInCustomLevel;
+            if (!catalogLoading && !thumbnails)
             {
                 return;
             }
@@ -119,7 +121,8 @@ namespace DIYLevelFastInit
                 }
                 List<KeyValuePair<string, LevelSetInfoSO>> infos = DIYLevelAssetBundleManager.levelSetInfos;
                 int done = (infos != null) ? infos.Count : 0;
-                string text = "DIY levels loading " + done + "/" + TotalSets;
+                string text = catalogLoading ? "DIY levels loading " + done + "/" + TotalSets
+                    : "DIY previews caching " + OnDemandResources.ThumbnailDone + "/" + OnDemandResources.ThumbnailTotal;
                 Rect rect = new Rect(Screen.width - 336, 6, 330, 26);
                 _progressStyle.normal.textColor = Color.black;
                 GUI.Label(new Rect(rect.x + 2f, rect.y + 2f, rect.width, rect.height), text, _progressStyle);
@@ -232,6 +235,7 @@ namespace DIYLevelFastInit
 
         internal static void FinishLoading()
         {
+            ThumbnailCache.Invalidate();
             Loading = false;
             FrontendOptionsMenu menu = TryGetMenu();
             if (menu != null)
@@ -239,7 +243,7 @@ namespace DIYLevelFastInit
                 UpdateMenuHeaderProgress(menu);
                 EnsureReloadButton(menu);
             }
-
+            OnDemandResources.QueueThumbnailWarmup();
         }
 
         private static bool SetupDirectoryPrefix(ref SceneDirectoryData __result)
@@ -752,7 +756,7 @@ namespace DIYLevelFastInit
 
         // Must resolve OC2DIYLevel.dll's own location: GetExecutingAssembly() here would
         // point at this plugin's directory instead.
-        private static string GetDiyPluginDir()
+        internal static string GetDiyPluginDir()
         {
             return Path.GetDirectoryName(typeof(DIYLevelAssetBundleManager).Assembly.Location);
         }
@@ -1262,7 +1266,12 @@ namespace DIYLevelFastInit
         private static HashSet<string> _previewBundles;
         private static PreviewRequest _previewRequest;
         private static bool _previewRunning;
+        private static bool _previewLoading, _warmRunning, _warmLoading, _warmQueued, _thumbnailAdapter;
+        private static int _warmGeneration;
+        private static HashSet<string> _warmBundles;
         private static float _lastPreviewTime;
+        internal static int ThumbnailDone, ThumbnailTotal;
+        internal static bool WarmingThumbnails { get { return _warmRunning; } }
         private static readonly Dictionary<string, LevelResources> Levels = new Dictionary<string, LevelResources>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<Scene, LevelResources> SceneObjects = new Dictionary<Scene, LevelResources>();
         private static readonly FieldInfo QuitClones = AccessTools.Field(typeof(RuntimePrefabManager), "runtimePrefabsClearOnQuit");
@@ -1309,28 +1318,32 @@ namespace DIYLevelFastInit
             MethodInfo method = AccessTools.Method(type, "UpdatePreview", new[] { typeof(Image), typeof(LevelInfoSO) });
             if (method == null) return;
             harmony.Patch(method, prefix: new HarmonyMethod(typeof(OnDemandResources), nameof(PreviewPrefix)));
+            _thumbnailAdapter = true;
             FastInitPlugin.Log.LogInfo("on-demand thumbnails: asynchronous StageThumbnailPreview adapter installed");
         }
 
-        private static void PreviewPrefix(Image __0, LevelInfoSO level)
+        private static bool PreviewPrefix(Image __0, LevelInfoSO level)
         {
-            if (__0 == null) return;
+            if (__0 == null) return true;
             if (level == null)
             {
                 if (_previewRequest != null && ReferenceEquals(_previewRequest.Image, __0)) _previewRequest = null;
-                return;
+                ThumbnailCache.Hide(__0);
+                return true;
             }
-            if (FastInitPlugin.Syncing || IsTransitioning || PseudoPrefabManager.isInCustomLevel) return;
+            if (FastInitPlugin.Syncing || IsTransitioning || PseudoPrefabManager.isInCustomLevel) return true;
             string path;
-            if (!FindCatalogLevel(level, out path)) return;
+            if (!FindCatalogLevel(level, out path)) return true;
             if (_previewRequest != null && ReferenceEquals(_previewRequest.Image, __0)
-                && ReferenceEquals(_previewRequest.Level, level)) return;
+                && ReferenceEquals(_previewRequest.Level, level)) return false;
+            ThumbnailCache.Hide(__0);
             _previewRequest = new PreviewRequest { Image = __0, Level = level, Path = path };
             _previewPath = path;
             _lastPreviewTime = Time.realtimeSinceStartup;
-            if (_previewRunning || FastInitPlugin.Instance == null) return;
+            if (_previewRunning || FastInitPlugin.Instance == null) return false;
             _previewRunning = true;
             FastInitPlugin.Instance.StartCoroutine(FastInitHost.Guard(PreviewRoutine(), "thumbnail queue"));
+            return false;
         }
 
         private static bool PreviewIsCurrent(PreviewRequest request)
@@ -1357,11 +1370,18 @@ namespace DIYLevelFastInit
                     if (request.Started) continue;
                     if (_catalogBundles != null) continue;
                     request.Started = true;
-                    ReleaseUnused();
-                    yield return WaitForCleanup();
-                    while (_catalogBundles != null) yield return null;
-                    if (!PreviewIsCurrent(request)) continue;
-                    yield return FastInitHost.Guard(LoadPreview(request), "thumbnail " + Path.GetFileName(request.Path));
+                    if (TryShowCachedPreview(request)) continue;
+                    _previewLoading = true;
+                    try
+                    {
+                        while (_warmLoading) yield return null;
+                        ReleaseUnused();
+                        yield return WaitForCleanup();
+                        while (_catalogBundles != null) yield return null;
+                        if (!PreviewIsCurrent(request)) continue;
+                        yield return FastInitHost.Guard(LoadPreview(request), "thumbnail " + Path.GetFileName(request.Path));
+                    }
+                    finally { _previewLoading = false; }
                 }
             }
             finally
@@ -1377,6 +1397,7 @@ namespace DIYLevelFastInit
             System.Diagnostics.Stopwatch timer = System.Diagnostics.Stopwatch.StartNew();
             try
             {
+                if (TryShowCachedPreview(request)) yield break;
                 LoadedSet set;
                 if (!Sets.TryGetValue(request.Path, out set))
                 {
@@ -1393,24 +1414,21 @@ namespace DIYLevelFastInit
                     if (!Sets.TryGetValue(request.Path, out set))
                     {
                         AssetBundle bundle = InfoBundles[files[0].FullName];
-                        AssetBundleRequest asset = bundle.LoadAssetAsync("LevelSetInfo", typeof(LevelSetInfoSO));
-                        PendingInfos.Add(request.Path, asset);
+                        Box<LevelSetInfoSO> loadedInfo = new Box<LevelSetInfoSO>();
                         try
                         {
-                            yield return FastInitHost.WaitOp(asset, "thumbnail info " + Path.GetFileName(request.Path));
+                            yield return EnsureInfoAssetAsync(request.Path, bundle, loadedInfo, 0);
                             if (!PreviewIsCurrent(request)) yield break;
                             if (!Sets.TryGetValue(request.Path, out set))
                             {
-                                LevelSetInfoSO info = asset.asset as LevelSetInfoSO;
-                                if (info == null) throw new IOException("Missing LevelSetInfo: " + request.Path);
-                                set = new LoadedSet { Bundle = bundle, Info = info };
+                                set = new LoadedSet { Bundle = bundle, Info = loadedInfo.Value };
                                 set.Required.UnionWith(_previewBundles);
                                 Sets.Add(request.Path, set);
                                 FastInitPlugin.Log.LogInfo("on-demand preview info loaded: " + Path.GetFileName(request.Path)
                                     + " (" + InfoBundles.Count + " bundles tracked)");
                             }
                         }
-                        finally { PendingInfos.Remove(request.Path); }
+                        finally { loadedInfo.Value = null; }
                     }
                 }
                 if (!PreviewIsCurrent(request)) yield break;
@@ -1418,9 +1436,19 @@ namespace DIYLevelFastInit
                 foreach (LevelInfoSO level in set.Info.levelInfos)
                     if (string.Equals(level.sceneName, request.Level.sceneName, StringComparison.OrdinalIgnoreCase)) { full = level; break; }
                 if (full == null) throw new IOException("Level no longer in preview info: " + request.Level.sceneName);
-                request.Level.screenshot = full.screenshot;
-                request.Image.sprite = full.screenshot;
-                request.Image.gameObject.SetActive(full.screenshot != null);
+                ThumbnailCache.Entry thumbnail = null;
+                try { thumbnail = ThumbnailCache.Capture(request.Path, request.Level.sceneName, full.screenshot); }
+                catch (Exception e) { FastInitPlugin.Log.LogWarning("thumbnail cache capture skipped: " + e.Message); }
+                if (thumbnail != null)
+                {
+                    ThumbnailCache.Show(thumbnail, request.Image);
+                    _previewPath = null;
+                }
+                else
+                {
+                    request.Image.sprite = full.screenshot;
+                    request.Image.gameObject.SetActive(full.screenshot != null);
+                }
                 FastInitPlugin.Log.LogInfo("thumbnail ready: " + request.Level.sceneName + " (async, " + timer.ElapsedMilliseconds + " ms elapsed)");
             }
             finally
@@ -1434,11 +1462,161 @@ namespace DIYLevelFastInit
         {
             _previewRequest = null;
             _previewPath = null;
+            ThumbnailCache.Hide(null);
+        }
+
+        private static bool TryShowCachedPreview(PreviewRequest request)
+        {
+            if (!PreviewIsCurrent(request)) return false;
+            System.Diagnostics.Stopwatch timer = System.Diagnostics.Stopwatch.StartNew();
+            bool memoryHit;
+            ThumbnailCache.Entry cached = ThumbnailCache.TryGet(request.Path, request.Level.sceneName, out memoryHit);
+            if (cached == null) return false;
+            ThumbnailCache.Show(cached, request.Image);
+            _previewPath = null;
+            ReleaseUnused();
+            FastInitPlugin.Log.LogInfo("thumbnail cache hit: " + request.Level.sceneName + " ("
+                + (memoryHit ? "memory" : "disk") + ", " + timer.ElapsedMilliseconds + " ms)");
+            return true;
         }
 
         internal static IEnumerator WaitForPreview()
         {
-            while (_previewRunning) yield return null;
+            while (_previewRunning || _warmRunning) yield return null;
+        }
+
+        private static IEnumerator EnsureInfoAssetAsync(string path, AssetBundle bundle, Box<LevelSetInfoSO> result, int priority)
+        {
+            AssetBundleRequest request;
+            if (!PendingInfos.TryGetValue(path, out request))
+            {
+                request = bundle.LoadAssetAsync("LevelSetInfo", typeof(LevelSetInfoSO));
+                request.priority = priority;
+                PendingInfos.Add(path, request);
+            }
+            try
+            {
+                yield return FastInitHost.WaitOp(request, "thumbnail info " + Path.GetFileName(path));
+                result.Value = request.asset as LevelSetInfoSO;
+                if (result.Value == null) throw new IOException("Missing LevelSetInfo: " + path);
+            }
+            finally
+            {
+                AssetBundleRequest pending;
+                if (request.isDone && PendingInfos.TryGetValue(path, out pending) && ReferenceEquals(pending, request)) PendingInfos.Remove(path);
+            }
+        }
+
+        internal static void QueueThumbnailWarmup()
+        {
+            if (!_thumbnailAdapter) return;
+            _warmGeneration++;
+            _warmQueued = true;
+            if (_warmRunning || FastInitPlugin.Instance == null) return;
+            _warmRunning = true;
+            FastInitPlugin.Instance.StartCoroutine(FastInitHost.Guard(WarmThumbnails(), "thumbnail prewarm"));
+        }
+
+        private static bool WarmupPaused()
+        {
+            return FastInitPlugin.Loading || FastInitPlugin.Syncing || IsTransitioning
+                || PseudoPrefabManager.isInCustomLevel || _previewLoading;
+        }
+
+        private static IEnumerator WarmThumbnails()
+        {
+            try
+            {
+                while (_warmQueued)
+                {
+                    _warmQueued = false;
+                    int generation = _warmGeneration;
+                    List<KeyValuePair<string, LevelSetInfoSO>> catalog = new List<KeyValuePair<string, LevelSetInfoSO>>(DIYLevelAssetBundleManager.levelSetInfos);
+                    HashSet<LevelInfoSO> completed = new HashSet<LevelInfoSO>();
+                    ThumbnailDone = ThumbnailTotal = 0;
+                    foreach (KeyValuePair<string, LevelSetInfoSO> set in catalog) ThumbnailTotal += set.Value.levelInfos.Length;
+                    yield return null;
+                    foreach (KeyValuePair<string, LevelSetInfoSO> set in catalog)
+                    {
+                        while (generation == _warmGeneration)
+                        {
+                            while (WarmupPaused() && generation == _warmGeneration) yield return null;
+                            if (generation != _warmGeneration) break;
+                            List<LevelInfoSO> missing = new List<LevelInfoSO>();
+                            foreach (LevelInfoSO level in set.Value.levelInfos)
+                                if (ThumbnailCache.IsReady(set.Key, level.sceneName)) completed.Add(level);
+                                else missing.Add(level);
+                            ThumbnailDone = completed.Count;
+                            if (missing.Count == 0) break;
+                            Box<bool> interrupted = new Box<bool>();
+                            yield return FastInitHost.Guard(WarmThumbnailSet(set.Key, missing, generation, interrupted), "thumbnail prewarm " + Path.GetFileName(set.Key));
+                            if (generation != _warmGeneration) break;
+                            yield return WaitForCleanup();
+                            if (interrupted.Value) continue;
+                            foreach (LevelInfoSO level in missing)
+                                if (ThumbnailCache.IsReady(set.Key, level.sceneName)) completed.Add(level);
+                            ThumbnailDone = completed.Count;
+                            break;
+                        }
+                        if (generation != _warmGeneration) break;
+                        yield return null;
+                    }
+                    if (generation == _warmGeneration)
+                    {
+                        string message = "thumbnail prewarm complete: " + ThumbnailDone + "/" + ThumbnailTotal + " disk entries ready";
+                        if (ThumbnailDone == ThumbnailTotal) FastInitPlugin.Log.LogInfo(message);
+                        else FastInitPlugin.Log.LogWarning(message + "; unavailable entries will load on demand");
+                    }
+                }
+            }
+            finally
+            {
+                _warmRunning = false;
+                _warmLoading = false;
+                _warmBundles = null;
+                ReleaseUnused();
+            }
+        }
+
+        private static IEnumerator WarmThumbnailSet(string path, List<LevelInfoSO> missing, int generation, Box<bool> interrupted)
+        {
+            Box<LevelSetInfoSO> info = new Box<LevelSetInfoSO>();
+            _warmLoading = true;
+            try
+            {
+                List<FileInfo> files = FastInitHost.SafeGetFiles(new DirectoryInfo(path), "info*");
+                if (files.Count == 0) throw new FileNotFoundException("Missing info bundle", path);
+                _warmBundles = InfoBundleGraph.Required(files[0].FullName, null);
+                foreach (string required in _warmBundles)
+                {
+                    if (WarmupPaused() || generation != _warmGeneration) { interrupted.Value = true; yield break; }
+                    yield return EnsureInfoBundleAsync(required, -10);
+                }
+                if (WarmupPaused() || generation != _warmGeneration) { interrupted.Value = true; yield break; }
+                yield return EnsureInfoAssetAsync(path, InfoBundles[files[0].FullName], info, -10);
+                foreach (LevelInfoSO catalogLevel in missing)
+                {
+                    while (!ThumbnailCache.HasWriteCapacity && !WarmupPaused() && generation == _warmGeneration) yield return null;
+                    if (WarmupPaused() || generation != _warmGeneration) { interrupted.Value = true; yield break; }
+                    if (ThumbnailCache.IsReady(path, catalogLevel.sceneName)) continue;
+                    foreach (LevelInfoSO level in info.Value.levelInfos)
+                        if (string.Equals(level.sceneName, catalogLevel.sceneName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            try { ThumbnailCache.Capture(path, catalogLevel.sceneName, level.screenshot, false); }
+                            catch (Exception e) { FastInitPlugin.Log.LogWarning("thumbnail prewarm skipped [" + catalogLevel.sceneName + "]: " + e.Message); }
+                            break;
+                        }
+                    yield return null;
+                }
+                while (ThumbnailCache.WritesBusy) yield return null;
+            }
+            finally
+            {
+                info.Value = null;
+                _warmLoading = false;
+                _warmBundles = null;
+                ReleaseUnused();
+            }
         }
 
         private static bool FindCatalogLevel(LevelInfoSO level, out string path)
@@ -1460,13 +1638,14 @@ namespace DIYLevelFastInit
             result.Value = InfoBundles[path];
         }
 
-        private static IEnumerator EnsureInfoBundleAsync(string path)
+        private static IEnumerator EnsureInfoBundleAsync(string path, int priority = 0)
         {
             if (InfoBundles.ContainsKey(path)) yield break;
             AssetBundleCreateRequest request;
             if (!PendingBundles.TryGetValue(path, out request))
             {
                 request = AssetBundle.LoadFromFileAsync(path);
+                request.priority = priority;
                 PendingBundles.Add(path, request);
             }
             try
@@ -1574,6 +1753,7 @@ namespace DIYLevelFastInit
             if (catalog == null) throw new InvalidOperationException("DIY level not found in catalog: " + scene);
             _pendingScene = scene;
             CancelPreview();
+            ThumbnailCache.ClearMemory();
             ReleaseUnused();
             LoadSet(path, scene);
             LevelInfoSO full = Resolve(catalog, path);
@@ -1728,7 +1908,7 @@ namespace DIYLevelFastInit
                 while (_cleanupRequested)
                 {
                     yield return null;
-                    while (IsTransitioning || PseudoPrefabManager.isInCustomLevel || _previewBundles != null
+                    while (IsTransitioning || PseudoPrefabManager.isInCustomLevel || _previewBundles != null || _warmBundles != null
                         || Time.realtimeSinceStartup - _lastPreviewTime < 0.5f) yield return null;
                     _cleanupRequested = false;
                     yield return Resources.UnloadUnusedAssets();
@@ -1779,6 +1959,8 @@ namespace DIYLevelFastInit
 
         internal static void ResetFrontend()
         {
+            _warmGeneration++;
+            _warmQueued = false;
             CancelPreview();
             ReleaseUnused();
         }
@@ -1802,6 +1984,7 @@ namespace DIYLevelFastInit
             HashSet<string> retained = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (_catalogBundles != null) retained.UnionWith(_catalogBundles);
             if (_previewBundles != null) retained.UnionWith(_previewBundles);
+            if (_warmBundles != null) retained.UnionWith(_warmBundles);
             foreach (LoadedSet set in Sets.Values)
             {
                 retained.UnionWith(set.Required);
@@ -1845,6 +2028,382 @@ namespace DIYLevelFastInit
         {
             List<GameObject> list = field.GetValue(null) as List<GameObject>;
             if (list != null) list.RemoveAll(value => value == null);
+        }
+    }
+
+    internal static class ThumbnailCache
+    {
+        internal sealed class Entry
+        {
+            internal string Key, File;
+            internal Texture2D Texture;
+            internal Sprite Sprite;
+            internal long Used;
+        }
+
+        private sealed class PendingWrite
+        {
+            internal string File;
+            internal byte[] Bytes;
+        }
+
+        private const int Magic = 0x314D4854, Version = 1;
+        private const int MaxWidth = 640, MaxHeight = 360, MaxBytes = 2 * 1024 * 1024;
+        private const long MaxDiskBytes = 128L * 1024 * 1024;
+        private static readonly byte[] PngSignature = { 137, 80, 78, 71, 13, 10, 26, 10 };
+        private static readonly Dictionary<string, Entry> Memory = new Dictionary<string, Entry>();
+        private static readonly Queue<PendingWrite> Writes = new Queue<PendingWrite>();
+        private static readonly object WriteLock = new object();
+        private static byte[] _stamp;
+        private static long _use;
+        private static bool _writerRunning;
+        private static Image _image;
+        private static string _boundKey;
+
+        internal static void Invalidate() { _stamp = null; }
+
+        internal static bool HasWriteCapacity { get { lock (WriteLock) return Writes.Count < 4; } }
+        internal static bool WritesBusy { get { lock (WriteLock) return _writerRunning || Writes.Count != 0; } }
+
+        private static string Root()
+        {
+            return Path.Combine(Path.Combine(Paths.CachePath, "DIYLevelFastInit"), "thumbnails");
+        }
+
+        private static string Key(string path, string scene)
+        {
+            using (SHA256 hash = SHA256.Create())
+                return BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(
+                    Path.GetFullPath(path).ToLowerInvariant() + "\n" + scene.ToLowerInvariant()))).Replace("-", "");
+        }
+
+        private static byte[] Stamp()
+        {
+            if (_stamp != null) return _stamp;
+            string plugin = FastInitPlugin.GetDiyPluginDir();
+            List<string> paths = new List<string>();
+            foreach (FileInfo file in new DirectoryInfo(plugin).GetFiles("common*")) paths.Add(file.FullName);
+            foreach (DirectoryInfo dir in new DirectoryInfo(Path.Combine(plugin, "levels")).GetDirectories())
+                foreach (FileInfo file in dir.GetFiles("info*")) paths.Add(file.FullName);
+            paths.Sort(StringComparer.OrdinalIgnoreCase);
+            using (MemoryStream stream = new MemoryStream())
+            using (BinaryWriter writer = new BinaryWriter(stream, Encoding.UTF8))
+            using (SHA256 hash = SHA256.Create())
+            {
+                foreach (string path in paths)
+                {
+                    FileInfo file = new FileInfo(path);
+                    writer.Write(path.ToLowerInvariant());
+                    writer.Write(file.Length);
+                    writer.Write(file.LastWriteTimeUtc.Ticks);
+                }
+                writer.Flush();
+                _stamp = hash.ComputeHash(stream.ToArray());
+            }
+            return _stamp;
+        }
+
+        internal static Entry TryGet(string path, string scene, out bool memoryHit)
+        {
+            memoryHit = false;
+            try
+            {
+                string key = Key(path, scene), memoryKey = key + BitConverter.ToString(Stamp());
+                Entry entry;
+                if (Memory.TryGetValue(memoryKey, out entry))
+                {
+                    entry.Used = ++_use;
+                    memoryHit = true;
+                    Enqueue(entry.File, null);
+                    return entry;
+                }
+                string file = Path.Combine(Root(), key + ".thumb");
+                if (!File.Exists(file)) return null;
+                if (new FileInfo(file).Length > MaxBytes + 84) throw new IOException("Thumbnail cache exceeds size limit");
+                byte[] png;
+                using (FileStream stream = File.OpenRead(file))
+                using (BinaryReader reader = new BinaryReader(stream)) png = ReadData(reader, Stamp());
+                Texture2D texture = null;
+                try
+                {
+                    if (png.Length != 0)
+                    {
+                        texture = new Texture2D(2, 2, TextureFormat.RGBA32, false);
+                        if (!ImageConversion.LoadImage(texture, png, true)) throw new IOException("Cannot decode cached thumbnail");
+                    }
+                    entry = Store(memoryKey, file, texture);
+                    texture = null;
+                }
+                finally { if (texture != null) UnityEngine.Object.DestroyImmediate(texture); }
+                Enqueue(file, null);
+                return entry;
+            }
+            catch (Exception e)
+            {
+                FastInitPlugin.Log.LogDebug("thumbnail cache miss [" + scene + "]: " + e.Message);
+                return null;
+            }
+        }
+
+        internal static bool IsReady(string path, string scene)
+        {
+            try
+            {
+                string file = Path.Combine(Root(), Key(path, scene) + ".thumb");
+                if (!File.Exists(file)) return false;
+                using (FileStream stream = File.OpenRead(file))
+                using (BinaryReader reader = new BinaryReader(stream))
+                {
+                    if (reader.ReadInt32() != Magic || reader.ReadInt32() != Version
+                        || !Equal(reader.ReadBytes(32), Stamp())) return false;
+                    int width = reader.ReadInt32(), height = reader.ReadInt32(), length = reader.ReadInt32();
+                    return length >= 0 && length <= MaxBytes && stream.Length == 84L + length
+                        && (length == 0 ? width == 0 && height == 0
+                            : width > 0 && width <= MaxWidth && height > 0 && height <= MaxHeight);
+                }
+            }
+            catch (Exception) { return false; }
+        }
+
+        internal static Entry Capture(string path, string scene, Sprite source, bool retain = true)
+        {
+            byte[] stamp = Stamp();
+            string key = Key(path, scene), file = Path.Combine(Root(), key + ".thumb");
+            Texture2D texture = null;
+            try
+            {
+                byte[] png = new byte[0];
+                if (source != null)
+                {
+                    if (source.packed && source.packingRotation != SpritePackingRotation.None)
+                        throw new IOException("Rotated packed screenshot cannot be cached");
+                    Rect rect = source.textureRect;
+                    if (rect.width <= 0 || rect.height <= 0) throw new IOException("Empty screenshot rectangle");
+                    float scale = Mathf.Min(1f, Mathf.Min(MaxWidth / rect.width, MaxHeight / rect.height));
+                    int width = Math.Max(1, Mathf.RoundToInt(rect.width * scale));
+                    int height = Math.Max(1, Mathf.RoundToInt(rect.height * scale));
+                    RenderTexture previous = RenderTexture.active;
+                    RenderTexture target = RenderTexture.GetTemporary(width, height, 0, RenderTextureFormat.ARGB32);
+                    try
+                    {
+                        Texture2D original = source.texture;
+                        Graphics.Blit(original, target, new Vector2(rect.width / original.width, rect.height / original.height),
+                            new Vector2(rect.x / original.width, rect.y / original.height));
+                        RenderTexture.active = target;
+                        texture = new Texture2D(width, height, TextureFormat.RGBA32, false);
+                        texture.ReadPixels(new Rect(0, 0, width, height), 0, 0, false);
+                        texture.Apply(false, false);
+                        png = ImageConversion.EncodeToPNG(texture);
+                        texture.Apply(false, true);
+                    }
+                    finally
+                    {
+                        RenderTexture.active = previous;
+                        RenderTexture.ReleaseTemporary(target);
+                    }
+                }
+                byte[] bytes;
+                using (MemoryStream stream = new MemoryStream())
+                using (BinaryWriter writer = new BinaryWriter(stream))
+                {
+                    WriteData(writer, stamp, png);
+                    writer.Flush();
+                    bytes = stream.ToArray();
+                }
+                Entry entry = null;
+                if (retain)
+                {
+                    entry = Store(key + BitConverter.ToString(stamp), file, texture);
+                    texture = null;
+                }
+                Enqueue(file, bytes);
+                return entry;
+            }
+            finally { if (texture != null) UnityEngine.Object.DestroyImmediate(texture); }
+        }
+
+        private static Entry Store(string key, string file, Texture2D texture)
+        {
+            Sprite sprite = null;
+            if (texture != null)
+            {
+                texture.hideFlags = HideFlags.DontUnloadUnusedAsset;
+                sprite = Sprite.Create(texture, new Rect(0, 0, texture.width, texture.height), new Vector2(0.5f, 0.5f));
+                sprite.hideFlags = HideFlags.DontUnloadUnusedAsset;
+            }
+            Entry entry = new Entry { Key = key, File = file, Texture = texture, Sprite = sprite, Used = ++_use };
+            Entry replaced;
+            if (Memory.TryGetValue(key, out replaced)) Destroy(replaced);
+            Memory[key] = entry;
+            TrimMemory();
+            return entry;
+        }
+
+        internal static void Show(Entry entry, Image image)
+        {
+            if (_image != null && _image != image) Hide(_image);
+            _image = image;
+            _boundKey = entry.Key;
+            image.sprite = entry.Sprite;
+            image.gameObject.SetActive(entry.Sprite != null);
+            entry.Used = ++_use;
+            TrimMemory();
+        }
+
+        internal static void Hide(Image image)
+        {
+            if (image == null) image = _image;
+            if (image != null)
+            {
+                image.sprite = null;
+                image.gameObject.SetActive(false);
+            }
+            if (image == _image) { _image = null; _boundKey = null; }
+        }
+
+        private static void TrimMemory()
+        {
+            while (Memory.Count > 8)
+            {
+                Entry oldest = null;
+                foreach (Entry entry in Memory.Values)
+                    if (entry.Key != _boundKey && (oldest == null || entry.Used < oldest.Used)) oldest = entry;
+                if (oldest == null) break;
+                Memory.Remove(oldest.Key);
+                Destroy(oldest);
+            }
+        }
+
+        internal static void ClearMemory()
+        {
+            Hide(null);
+            foreach (Entry entry in Memory.Values) Destroy(entry);
+            Memory.Clear();
+        }
+
+        private static void Destroy(Entry entry)
+        {
+            if (entry.Sprite != null) UnityEngine.Object.DestroyImmediate(entry.Sprite);
+            if (entry.Texture != null) UnityEngine.Object.DestroyImmediate(entry.Texture);
+        }
+
+        internal static void WriteData(BinaryWriter writer, byte[] stamp, byte[] png)
+        {
+            int width, height;
+            Dimensions(png, out width, out height);
+            if (stamp.Length != 32) throw new IOException("Invalid thumbnail source stamp");
+            writer.Write(Magic);
+            writer.Write(Version);
+            writer.Write(stamp);
+            writer.Write(width);
+            writer.Write(height);
+            writer.Write(png.Length);
+            using (SHA256 hash = SHA256.Create()) writer.Write(hash.ComputeHash(png));
+            writer.Write(png);
+        }
+
+        internal static byte[] ReadData(BinaryReader reader, byte[] stamp)
+        {
+            if (reader.ReadInt32() != Magic || reader.ReadInt32() != Version) throw new IOException("Invalid thumbnail cache version");
+            if (!Equal(reader.ReadBytes(32), stamp)) throw new IOException("Thumbnail source fingerprint changed");
+            int width = reader.ReadInt32(), height = reader.ReadInt32(), length = reader.ReadInt32();
+            if (length < 0 || length > MaxBytes) throw new IOException("Invalid thumbnail payload size");
+            byte[] digest = reader.ReadBytes(32), png = reader.ReadBytes(length);
+            if (png.Length != length || reader.BaseStream.Position != reader.BaseStream.Length) throw new IOException("Truncated thumbnail or trailing data");
+            using (SHA256 hash = SHA256.Create())
+                if (!Equal(hash.ComputeHash(png), digest)) throw new IOException("Thumbnail checksum mismatch");
+            int actualWidth, actualHeight;
+            Dimensions(png, out actualWidth, out actualHeight);
+            if (width != actualWidth || height != actualHeight) throw new IOException("Thumbnail dimensions do not match PNG");
+            return png;
+        }
+
+        private static void Dimensions(byte[] png, out int width, out int height)
+        {
+            width = height = 0;
+            if (png.Length == 0) return;
+            if (png.Length < 33 || png.Length > MaxBytes) throw new IOException("Invalid thumbnail PNG size");
+            for (int i = 0; i < 8; i++) if (png[i] != PngSignature[i]) throw new IOException("Invalid thumbnail PNG signature");
+            if (png[8] != 0 || png[9] != 0 || png[10] != 0 || png[11] != 13
+                || png[12] != 73 || png[13] != 72 || png[14] != 68 || png[15] != 82) throw new IOException("Invalid PNG header");
+            width = png[16] << 24 | png[17] << 16 | png[18] << 8 | png[19];
+            height = png[20] << 24 | png[21] << 16 | png[22] << 8 | png[23];
+            if (width < 1 || width > MaxWidth || height < 1 || height > MaxHeight) throw new IOException("Thumbnail dimensions exceed limit");
+        }
+
+        private static bool Equal(byte[] a, byte[] b)
+        {
+            if (a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+
+        private static void Enqueue(string file, byte[] bytes)
+        {
+            lock (WriteLock)
+            {
+                if (Writes.Count == 4)
+                {
+                    if (bytes == null) return;
+                    Writes.Dequeue();
+                }
+                Writes.Enqueue(new PendingWrite { File = file, Bytes = bytes });
+                if (_writerRunning) return;
+                _writerRunning = true;
+                System.Threading.ThreadPool.QueueUserWorkItem(WriteLoop);
+            }
+        }
+
+        private static void WriteLoop(object unused)
+        {
+            while (true)
+            {
+                PendingWrite write;
+                lock (WriteLock)
+                {
+                    if (Writes.Count == 0) { _writerRunning = false; return; }
+                    write = Writes.Dequeue();
+                }
+                string temporary = null;
+                try
+                {
+                    if (write.Bytes == null)
+                    {
+                        if (File.Exists(write.File)) File.SetLastWriteTimeUtc(write.File, DateTime.UtcNow);
+                        continue;
+                    }
+                    string root = Path.GetDirectoryName(write.File);
+                    Directory.CreateDirectory(root);
+                    temporary = write.File + ".tmp-" + Guid.NewGuid().ToString("N");
+                    File.WriteAllBytes(temporary, write.Bytes);
+                    if (File.Exists(write.File)) File.Replace(temporary, write.File, null);
+                    else File.Move(temporary, write.File);
+                    temporary = null;
+                    TrimDisk(root);
+                    FastInitPlugin.Log.LogDebug("thumbnail cache stored: " + Path.GetFileName(write.File));
+                }
+                catch (Exception e) { FastInitPlugin.Log.LogDebug("thumbnail cache write skipped: " + e.Message); }
+                finally
+                {
+                    if (temporary != null)
+                        try { File.Delete(temporary); } catch (Exception) { }
+                }
+            }
+        }
+
+        private static void TrimDisk(string root)
+        {
+            List<FileInfo> files = new List<FileInfo>(new DirectoryInfo(root).GetFiles("*.thumb"));
+            long size = 0;
+            foreach (FileInfo file in files) size += file.Length;
+            files.Sort((a, b) => a.LastWriteTimeUtc.CompareTo(b.LastWriteTimeUtc));
+            foreach (FileInfo file in files)
+            {
+                if (size <= MaxDiskBytes) break;
+                long length = file.Length;
+                file.Delete();
+                size -= length;
+            }
         }
     }
 

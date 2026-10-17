@@ -4,7 +4,7 @@ Startup and memory optimization for the [OC2DIYLevel](https://github.com/gua248/
 
 [中文说明](README_CN.md)
 
-## Version 1.6.3
+## Version 1.6.4
 
 Asynchronous loading removed the main-menu freeze, but keeping every info bundle and prebuilding four configurations for every level still consumed the limited address space of the 32-bit game.
 
@@ -16,7 +16,7 @@ This version separates the complete level catalog from gameplay resources:
 4. Load the selected info bundle and build four player-count configurations for **the selected level** before the host or client uses it. Replays can reuse directory configurations.
    Read scene and info metadata to follow transitive references to other sets' info bundles. Dependency-only bundles open their containers without loading their `LevelSetInfo` or building configurations; shared dependencies remain until their final user exits. This fixes missing cross-set material references while retaining on-demand loading. The reader is built into the DLL and needs no Python or extra plugin.
 5. Release unused info bundles, generated configurations and prefab clones after their scenes are no longer in use. Detach full-info references and use `Unload(false)` for info bundles, then coalesce `Resources.UnloadUnusedAssets()` requests in the frontend so assets still referenced by materials or scenes survive. Do not start this cleanup during DIY gameplay or transitions. Temporary overlap is allowed during transitions. Scene-instance objects created by a replay are collected independently of reusable directory configurations.
-6. Adapt OC2StageThumbnailPreview 1.0.0 with asynchronous on-demand previews. Opening a set displays its menu immediately while its image loads, avoiding multi-second synchronous info loads in the menu callback. Coalesce rapid focus changes, show only the latest requested image, and drain/release obsolete native requests. Only one preview set is retained. The sorting plugin continues to receive stable lightweight SOs.
+6. Adapt OC2StageThumbnailPreview 1.0.0 with persistent thumbnail caching. After catalog discovery, automatically generate thumbnails **before browsing**, one set at a time, and release each source graph before advancing. A progress badge shows completed disk entries. Generate images up to 640 × 360, write them asynchronously under `BepInEx/cache/DIYLevelFastInit/thumbnails/`, and read the small images directly when browsing. Keep at most eight decoded thumbnails in memory, clearing them on level entry; disk storage is capped at 128 MiB with oldest-entry eviction. Fingerprint source info/common files and validate image dimensions, payload bounds and checksums. Prewarming pauses for gameplay, transitions and uncached preview requests. Cache hits bypass in-flight prewarming; missing or invalid entries fall back to asynchronous source loading. Coalesce rapid focus changes and apply only the current image. The sorting plugin continues to receive stable lightweight SOs.
 7. Retain incremental hot reload. Refresh is blocked during a level or transition; level selection is blocked during a refresh.
 8. If an async request takes over 15 seconds, log the delay and keep waiting for that same request. Only a completed failed request may fall back to synchronous loading; Unity cannot cancel an unfinished request safely.
 
@@ -26,7 +26,7 @@ Vanilla shared dependencies keep their original reference-counted lifetime. The 
 
 The resource loading unit is still **one info bundle plus transitive info dependencies of the selected scene/set**, not one individual level. A very large set may still require substantial memory. Finer granularity requires changes to level export and bundle layout. Common bundles and resources retained by other mods remain outside this plugin's cleanup scope.
 
-The first catalog scan, first preview of a set, and first level entry still have I/O, decompression and configuration costs. Selected-set preparation uses a synchronous path and can briefly stall for a large bundle. Wait for initial catalog discovery before relying on the full list or joining a custom game.
+The first catalog scan, thumbnail prewarming, and first level entry still have I/O, decompression and configuration costs. Prewarming loads full source info graphs temporarily, with one image capture per frame and unused-asset collection between sets. Until a thumbnail is cached, its preview may take time to appear. With the optional thumbnail plugin absent, thumbnail prewarming is skipped. Selected-set preparation uses a synchronous path and can briefly stall for a large bundle. Wait for initial catalog discovery before relying on the full list or joining a custom game.
 
 ## Install or roll back
 
@@ -49,6 +49,7 @@ Relevant lines in `BepInEx/LogOutput.log`:
 - `on-demand info loaded/released` for tracked info bundle counts; detached assets may remain until unused-asset collection.
 - `info dependency graph` and `info dependency released` for selected-scene dependencies and shared bundle lifetimes.
 - `on-demand preview info loaded` and `thumbnail ready (... async ... ms elapsed)` for completed previews; elapsed time includes asynchronous waiting and does not measure main-thread stalls.
+- `thumbnail prewarm complete: ... disk entries ready` for automatic disk generation; `thumbnail cache hit: ... (disk|memory, ... ms)` for browsing without a source info load.
 - `on-demand config ready/released` and `scene runtime objects released` for generated object lifetimes.
 - `scene material audit` and `scene material invalid` for a read-only check of shader references and support after DIY scene entry. The audit does not replace materials.
 
