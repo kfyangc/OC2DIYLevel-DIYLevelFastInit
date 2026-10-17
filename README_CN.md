@@ -4,7 +4,7 @@
 
 [English README](README.md)
 
-## 1.6.5 的行为
+## 1.6.6 的行为
 
 此前的异步加载消除了主菜单的长时间冻结，但全部 `info_*` 资源和所有关卡的四套人数配置仍然常驻。对于 32 位游戏，启动快并不等于内存占用低。
 
@@ -14,6 +14,7 @@
 - **磁盘目录缓存**：缓存写入 `BepInEx/cache/DIYLevelFastInit/`，采用带版本号、长度上限和完整性检查的二进制格式，只包含字符串与数值，不依赖 Unity 的 JSON 序列化器。下次启动按路径、info 文件名、长度及修改时间校验，命中时无需加载对应 info 包。缓存损坏或无法写入时回退到扫描；可在游戏关闭后删除缓存以强制重建。
 - **轻量场景目录**：保留全部关卡及原有位置映射，供菜单、街机和存档使用；打开存档选择界面不再生成全量配方配置。
 - **目标关卡配置**：单机／房主确认存档后先让出一帧，异步读取目标关卡的 info 资源，再分帧准备该关卡的四套人数配置，显示准备进度；就绪后只继续一次原来的服务器加载流程，准备中合并重复请求。其他关卡不预热，重开同关可复用目录配置。客户端的网络消息调用方需要立即得到会话和关卡设置，因此保留同步准备时序。
+- **加载优先级**：单机／房主确认进入关卡、已有缩略图和目录请求结束后，临时把 Unity 后台加载优先级提高到 `High`，覆盖资源准备及目标场景加载；目标关卡或前端场景就绪、准备失败、插件销毁时恢复之前的值。如果其他加载器已改成不同的值，则保留其修改。加载期间可能牺牲帧率以缩短等待，并分别记录资源包加载与 info 资源实例化耗时；资源保留策略和磁盘缓存格式保持原状。
 - **跨关卡集依赖**：读取场景和 info 的资源引用元数据，递归加载它们实际依赖的其他 info 包，修复只加载自身 info 时跨关卡集材质丢失的问题。依赖包只打开容器，不额外读取其 `LevelSetInfo` 或生成关卡配置；共享依赖保留到最后一个使用者退出。只读元数据解析内置在 DLL 中，无需 Python 或额外插件。
 - **资源回收**：按场景是否仍在使用决定何时释放 info、配置和运行时 prefab。info 包解除引用并 `Unload(false)` 后，合并清理请求，在前端由 `Resources.UnloadUnusedAssets()` 回收无引用对象，保留仍被使用的材质和 Shader；不在 DIY 关卡或切图中主动启动这项清理。切图允许新旧资源短暂重叠；每次重开产生的场景运行时对象按场景实例回收。
 - **提前生成缩略图**：内置对 OC2StageThumbnailPreview 1.0.0 的适配。目录加载完成后，自动逐个关卡集提前生成小图，写入 `BepInEx/cache/DIYLevelFastInit/thumbnails/`，无需先逐张浏览；屏幕显示缓存进度。每个关卡集生成完就释放源资源并等待回收。之后浏览直接读取硬盘上的小图，最大 640 × 360；内存最多保留最近 8 张，进入关卡时清空，硬盘最多 128 MiB，超限淘汰最旧条目。按 info/common 源文件指纹判断过期，校验图片尺寸、长度和校验和。后台生成会为游戏、切图和未缓存的前台预览暂停；已缓存的图片可直接读取，无需等待正在进行的预生成。缺失或无效缓存回退到异步读取源包。快速切换只显示最新选中的图片；排序插件仍使用原有的轻量 SO 对象。
@@ -53,6 +54,7 @@ dotnet build -c Release -p:GameDir="D:\Games\Steam Games\steamapps\common\Overco
 - `thumbnail prewarm complete: ... disk entries ready`：提前生成的磁盘条目数量；`thumbnail cache hit: ... (disk|memory, ... ms)`：浏览命中缓存，没有读取源 info。
 - `on-demand config ready/released`、`scene runtime objects released`：目标配置与每次场景实例的回收。
 - `async level preparation started`、`async level resources ready`、`on-demand config ready (... async level entry ...)`：单机／房主异步准备；总耗时包含异步等待，单套配置耗时超过或等于 50 毫秒时还会输出 Info 计时。
+- `level loading priority`、`level loading priority released`：临时提高与释放加载优先级；`level bundle ready`、`level info asset ready`：分阶段计时。优先级释放日志还会记录交给原始切图流程后的耗时。
 - `scene material audit`、`scene material invalid`：进入 DIY 场景后对材质 Shader 引用与支持状态做一次只读检查；不会自动替换材质。
 
 回归检查应覆盖：浏览和排序、缩略图、存档选择与读写、进入关卡、连续重开、跨关卡集切图、返回菜单、热刷新，以及房主和客户端联机。记录游戏进程的专用内存；场景切换有暂时峰值，不能仅凭一次读数判断泄漏。构建和签名检查不能替代实机测试。

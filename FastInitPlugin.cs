@@ -28,7 +28,7 @@ namespace DIYLevelFastInit
     {
         public const string PluginGuid = "oc2.diylevel.fastinit";
         public const string PluginName = "DIYLevel FastInit";
-        public const string PluginVersion = "1.6.5";
+        public const string PluginVersion = "1.6.6";
 
         internal static ManualLogSource Log;
 
@@ -100,6 +100,11 @@ namespace DIYLevelFastInit
             if (!_patchesReady) return;
             try { OnDemandResources.InstallPreviewHooks(new Harmony(PluginGuid)); }
             catch (Exception e) { Log.LogWarning("thumbnail adapter unavailable: " + e); }
+        }
+
+        private void OnDestroy()
+        {
+            OnDemandResources.RestoreEntryPriority("plugin shutdown");
         }
 
         private void OnGUI()
@@ -1273,6 +1278,11 @@ namespace DIYLevelFastInit
         private static HashSet<string> _warmBundles;
         private static HashSet<string> _preparingBundles;
         private static bool _serverPreparing, _resumeServerLoad;
+        private static bool _entryPriorityActive;
+        private static UnityEngine.ThreadPriority _previousEntryPriority;
+        private static string _entryPriorityScene;
+        private static System.Diagnostics.Stopwatch _entryPriorityTimer;
+        private static long _entrySceneHandoff;
         internal static string LevelLoadProgress;
         private static float _lastPreviewTime;
         internal static int ThumbnailDone, ThumbnailTotal;
@@ -1772,11 +1782,19 @@ namespace DIYLevelFastInit
                 CancelPreview();
                 ThumbnailCache.ClearMemory();
                 while (_warmLoading || _previewLoading || _catalogBundles != null) yield return null;
+                BoostEntryPriority(scene);
                 ReleaseUnused();
                 List<FileInfo> files = FastInitHost.SafeGetFiles(new DirectoryInfo(path), "info*");
                 if (files.Count == 0) throw new FileNotFoundException("Missing info bundle", path);
                 _preparingBundles = InfoBundleGraph.Required(files[0].FullName, Path.Combine(path, scene));
-                foreach (string required in _preparingBundles) yield return EnsureInfoBundleAsync(required, 10);
+                foreach (string required in _preparingBundles)
+                {
+                    bool resident = InfoBundles.ContainsKey(required);
+                    System.Diagnostics.Stopwatch bundleTimer = System.Diagnostics.Stopwatch.StartNew();
+                    yield return EnsureInfoBundleAsync(required, 10);
+                    FastInitPlugin.Log.LogInfo("level bundle ready: " + Path.GetFileName(required) + " ("
+                        + (resident ? "resident" : "async") + ", " + bundleTimer.ElapsedMilliseconds + " ms elapsed)");
+                }
                 LoadedSet set;
                 if (!Sets.TryGetValue(path, out set))
                 {
@@ -1784,7 +1802,9 @@ namespace DIYLevelFastInit
                     try
                     {
                         AssetBundle bundle = InfoBundles[files[0].FullName];
+                        System.Diagnostics.Stopwatch assetTimer = System.Diagnostics.Stopwatch.StartNew();
                         yield return EnsureInfoAssetAsync(path, bundle, info, 10);
+                        FastInitPlugin.Log.LogInfo("level info asset ready: " + scene + " (" + assetTimer.ElapsedMilliseconds + " ms elapsed)");
                         set = new LoadedSet { Bundle = bundle, Info = info.Value };
                         set.Required.UnionWith(InfoBundleGraph.Required(files[0].FullName, null));
                         Sets.Add(path, set);
@@ -1812,6 +1832,7 @@ namespace DIYLevelFastInit
                 try
                 {
                     _resumeServerLoad = true;
+                    if (_entryPriorityActive) _entrySceneHandoff = _entryPriorityTimer.ElapsedMilliseconds;
                     DIYLevelAssetBundleManager.LoadLevelServer(scene);
                     resumed = true;
                 }
@@ -1822,9 +1843,38 @@ namespace DIYLevelFastInit
                 LevelLoadProgress = null;
                 _serverPreparing = false;
                 _preparingBundles = null;
-                if (!resumed) _pendingScene = null;
+                if (!resumed)
+                {
+                    _pendingScene = null;
+                    RestoreEntryPriority("preparation interrupted");
+                }
                 ReleaseUnused();
             }
+        }
+
+        private static void BoostEntryPriority(string scene)
+        {
+            RestoreEntryPriority("new level request");
+            _previousEntryPriority = Application.backgroundLoadingPriority;
+            Application.backgroundLoadingPriority = UnityEngine.ThreadPriority.High;
+            _entryPriorityScene = scene;
+            _entryPriorityTimer = System.Diagnostics.Stopwatch.StartNew();
+            _entrySceneHandoff = -1;
+            _entryPriorityActive = true;
+            FastInitPlugin.Log.LogInfo("level loading priority: " + _previousEntryPriority + " -> High [" + scene + "]");
+        }
+
+        internal static void RestoreEntryPriority(string reason)
+        {
+            if (!_entryPriorityActive) return;
+            _entryPriorityActive = false;
+            if (Application.backgroundLoadingPriority == UnityEngine.ThreadPriority.High)
+                Application.backgroundLoadingPriority = _previousEntryPriority;
+            long elapsed = _entryPriorityTimer.ElapsedMilliseconds;
+            FastInitPlugin.Log.LogInfo("level loading priority released: " + Application.backgroundLoadingPriority + ", " + reason + " [" + _entryPriorityScene
+                + "] (" + elapsed + " ms total" + (_entrySceneHandoff < 0 ? "" : ", " + (elapsed - _entrySceneHandoff) + " ms since scene handoff") + ")");
+            _entryPriorityScene = null;
+            _entryPriorityTimer = null;
         }
 
         private static bool SelectionPrefix() { return !FastInitPlugin.Syncing && !IsTransitioning && _catalogBundles == null; }
@@ -1964,6 +2014,8 @@ namespace DIYLevelFastInit
         private static void SceneLoaded(Scene scene, LoadSceneMode mode)
         {
             bool frontend = scene.name == "StartScreen" || scene.name == "Lobbies";
+            if (_entryPriorityActive && (frontend || string.Equals(scene.name, _entryPriorityScene, StringComparison.OrdinalIgnoreCase)))
+                RestoreEntryPriority("scene ready: " + scene.name);
             if (frontend || string.Equals(scene.name, _pendingScene, StringComparison.OrdinalIgnoreCase))
             {
                 _pendingScene = null;

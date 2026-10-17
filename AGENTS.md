@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35, single file `FastInitPlugin.cs`) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.5 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.6 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -84,6 +84,15 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   through a narrowly scoped `_resumeServerLoad` guard after everything is ready.
   Ignore duplicate server requests while `_serverPreparing`; finally paths release
   preparation pins/progress and clear the pending scene on failure.
+- `BoostEntryPriority` saves `Application.backgroundLoadingPriority` and temporarily
+  sets `High` after active preview/discovery native requests drain. Its scope covers
+  server resource preparation through target scene arrival; restore on target/frontend
+  `sceneLoaded`, failed/disposed preparation and plugin `OnDestroy`. Restore only while
+  the current value is still `High`, preserving a different value set by another loader.
+  Do not boost ordinary thumbnail warmup, browsing or client callbacks. Keep the scope
+  separate from `_serverPreparing`, which ends at the original scene-load handoff.
+  Bundle and info-asset phase timers plus handoff-to-scene timing support comparisons;
+  priority changes do not guarantee instant entry and may reduce loading-time frame rate.
 - `LoadPrefix` / `PrepareLevel` remain synchronous for `LoadLevelClientPatch`.
   OC2DIYLevel calls it from a prefix on `NetworkUtils.LevelLoadByName`; returning early
   would let the original network handler consume incomplete session/level settings.
