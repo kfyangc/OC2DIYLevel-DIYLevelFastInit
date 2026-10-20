@@ -4,7 +4,7 @@
 
 [English README](README.md)
 
-## 1.6.9 的行为
+## 1.6.10 的行为
 
 此前的异步加载消除了主菜单的长时间冻结，但全部 `info_*` 资源和所有关卡的四套人数配置仍然常驻。对于 32 位游戏，启动快并不等于内存占用低。
 
@@ -19,7 +19,7 @@
 - **七池独立资源**：读取 `info_qichi` 前，先通过已安装的七池运行库（v10 接口）准备独立的 `qichi_assets`。等待已有异步请求，或复用已加载的包，并同步运行库的完成状态，避免反复重复加载。冷扫描、源图预览和单机／房主、客户端进图均覆盖；资源包仍由七池运行库持有，FastInit 不卸载。缺少运行库时记录提示；已安装的加载器接口不兼容或请求失败时，中止本次资源准备。
 - **资源回收**：按场景是否仍在使用决定何时释放 info、配置和运行时 prefab。info 包解除引用并 `Unload(false)` 后，合并清理请求，在前端由 `Resources.UnloadUnusedAssets()` 回收无引用对象，保留仍被使用的材质和 Shader；不在 DIY 关卡或切图中主动启动这项清理。切图允许新旧资源短暂重叠；每次重开产生的场景运行时对象按场景实例回收。
 - **提前生成缩略图**：内置对 OC2StageThumbnailPreview 1.0.0 的适配。目录加载完成后，自动逐个关卡集提前生成小图，写入 `BepInEx/cache/DIYLevelFastInit/thumbnails/`，无需先逐张浏览；屏幕显示缓存进度。每个关卡集生成完就释放源资源并等待回收。之后浏览直接读取硬盘上的小图，最大 640 × 360；内存最多保留最近 8 张，进入关卡时清空，硬盘最多 128 MiB，超限淘汰最旧条目。按 info/common 源文件指纹判断过期，校验图片尺寸、长度和校验和。后台生成会为游戏、切图和未缓存的前台预览暂停；已缓存的图片可直接读取，无需等待正在进行的预生成。缺失或无效缓存回退到异步读取源包。快速切换只显示最新选中的图片；排序插件仍使用原有的轻量 SO 对象。
-- **选档与加载衔接**：拦截同帧重复选关、已打开或切图期间的重复选档请求，以及已确认存档的重复回调。客机收到 DIY 切图指令后，先停止选档倒计时，通过原有清理流程关闭选档与等待界面，回复“开始加载”，再异步准备 info 和目标关卡配置。准备期间拦截旧的选档确认；恢复切图消息时不重复发送开始加载回执。“关卡已就绪”仍由原来的场景加载流程通知，不会提前冒充完成。只作用于 DIY DLC 15；取消选档后仍可重新选择。
+- **选档与加载衔接**：拦截同帧重复选关、已打开或切图期间的重复选档请求，以及重复的存档确认。完成选择（含“不保存”）后记住本轮结果并停止客机选档倒计时；重复收到房主请求时复用已选存档并补发就绪回执，进入加载后不再补发旧选档状态。单机／房主与客机在准备资源前都通过 `Hide(false)` 正常关闭选档和等待界面；若存档读写仍在处理，每帧等待其可清理，不强行中断，关闭时不恢复旧的上级界面。客机先回复“开始加载”，资源就绪后只恢复一次切图消息；“关卡已就绪”仍由原始场景流程通知。新选关、连接重置和场景到达清除本轮选择记录。只作用于 DIY DLC 15；确认前取消仍可重新选择。
 - **热刷新**：保留“刷新关卡列表”，只更新有变化的目录；正在切图或关卡内不刷新。刷新过程中禁止选关。
 - **异步请求**：15 秒未完成时记录等待提示，继续等待同一个请求；仅在请求已经完成且失败后同步重试，避免无法取消的旧请求与新请求争抢同一个包。
 
@@ -61,11 +61,11 @@ dotnet build -c Release -p:GameDir="D:\Games\Steam Games\steamapps\common\Overco
 - `async level preparation started`、`async level resources ready`、`on-demand config ready (... async level entry ...)`：单机／房主异步准备；总耗时包含异步等待，单套配置耗时超过或等于 50 毫秒时还会输出 Info 计时。
 - `DIY client level message deferred/resumed`、`async client level preparation started`、`client level bundle ready`、`client level info asset ready`：客机异步准备及一次恢复；`DIY client level preparation cancelled`：旧连接或旧目标失效。
 - `duplicate DIY ... ignored`：重复选关、选档或存档确认被拦截。
-- `DIY client save wait ended`、`DIY client loading acknowledged before resources`、`DIY client state sent`：选档结束到开始加载的衔接。`DIY client disconnect path`：客机开始加载后两分钟内的断线调用路径，只记录，不改变断线处理。
+- `DIY save dialog opened/closed`、`DIY save choice confirmed`、`DIY server save acknowledgement received`、`DIY server/client save UI closed`：选档弹出、关闭、确认、房主收到回执，以及加载前界面清理。房主回执列出各机器／槽位的游戏状态，不记录账号 ID。`DIY client loading acknowledged before resources`、`DIY client state sent`：开始加载的衔接；`DIY client disconnect path`：客机开始加载后两分钟内的断线调用路径，只记录，不改变断线处理。`Qichi runtime request startup`：七池原生异步等待之前，同步启动请求（含运行库读文件／解码）的耗时。
 - `level loading priority`、`level loading priority released`：临时提高与释放加载优先级；`level bundle ready`、`level info asset ready`：分阶段计时。优先级释放日志还会记录交给原始切图流程后的耗时。
 - `scene material audit`、`scene material invalid`：进入 DIY 场景后对材质 Shader 引用与支持状态做一次只读检查；不会自动替换材质。
 
-回归检查应覆盖：浏览和排序、缩略图、存档选择与读写、进入关卡、连续重开、跨关卡集切图、返回菜单、热刷新，以及房主和客户端联机。记录游戏进程的专用内存；场景切换有暂时峰值，不能仅凭一次读数判断泄漏。1.6.9 已通过离线消息所有权、一次恢复、开始加载回执提前且不重复、旧选档状态拦截、原始关卡就绪信号保留、取消、发送失败和重连检查；28 个补丁签名及选档字段／方法均与已安装程序集核对通过。原生界面行为、DMM／七池／test 的双方联机，以及选档取消后重选仍需实机回归，不能据此承诺所有网络错误已经修复。
+回归检查应覆盖：浏览和排序、缩略图、存档选择与读写、进入关卡、连续重开、跨关卡集切图、返回菜单、热刷新，以及房主和客户端联机。记录游戏进程的专用内存；场景切换有暂时峰值，不能仅凭一次读数判断泄漏。1.6.10 已通过离线消息所有权、一次恢复、开始加载回执提前且不重复、旧选档状态拦截、原始关卡就绪信号保留、取消、发送失败和重连检查；另验证了已确认选择的复用、跨前端／重置隔离，以及存档忙时逐帧等待关闭。31 个补丁签名及选档字段／方法均与已安装程序集核对通过。1.6.9 的 DMM 联机已有可进入反馈；1.6.10 的原生界面及双方联机仍需回归。七池客机退出尚未定位，需要出问题的客机日志，不能据此承诺已修复。
 
 ## 声明
 

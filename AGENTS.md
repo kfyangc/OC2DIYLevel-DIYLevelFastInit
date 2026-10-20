@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35, single file `FastInitPlugin.cs`) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.9 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.10 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -110,9 +110,12 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
 - `PrepareResources` shares async bundle/info preparation and per-frame configuration
   factories between server and gated client entry. Keep `_directoryBuild` scoped to each
   synchronous factory. A complex individual config or scene activation may still spike.
-- On remote DIY entry, stop the frontend client save countdown, clear pending DIY save
-  payloads, force-close active DIY save dialogs through their existing cleanup path and
-  hide the save-wait overlay before preparing resources. Prevent countdown restart and
+- On both server/single-player and remote DIY entry, stop the frontend client save
+  countdown, clear pending DIY save payloads and hide the save-wait overlay before
+  closing save dialogs through `Hide(false)`. Yield while a dialog refuses to hide;
+  keep its write/load routine running and check the entry identity between frames.
+  Close the host UI after the initial yield, outside its save-ready callback stack.
+  Never restore the dialog's invoker while entering. Prevent countdown restart and
   stale `LoadedCampaignMapSave` sends during the transition. Announce only the message's
   start-loading state before native waits; suppress its duplicate during the scoped
   replay. Never announce `LoadedKitchen` early: the original scene readiness path owns it.
@@ -122,7 +125,13 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
 - Save-dialog guards cover DLC 15 only: suppress same-frame selection reentry, an already
   visible dialog, dialog reopening during entry, and repeated `OnSaveGameReady` callbacks.
   Clear duplicate frontend save payloads when suppressing their show attempt, so Update
-  does not retry them indefinitely. A cancelled dialog and a new frontend allow reselection.
+  does not retry them indefinitely. `SaveSelectionState` retains only the frontend
+  identity once a choice finishes (including Don't Save), stopping its client countdown.
+  Reuse a confirmed choice and repeat the real save-ready acknowledgement for a duplicate
+  frontend request; never repeat it during level entry. New host selections, client
+  lifecycle resets, target scene arrival and frontend arrival clear the retained choice.
+  Cancellation before confirmation permits reselection. Log successful dialog opens /
+  closes, outgoing save-ready state and the server's updated per-machine/slot states.
 - Public `levelSetInfos` entries remain lightweight SOs with stable identities; full
   `LoadedSet.Info` objects stay private. The directory remains complete for save IDs,
   original dependency lookup, sorting and arcade selection. Never replace it with a
@@ -201,6 +210,8 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   reference. Do not start a duplicate while a request is pending. Qichi owns this bundle;
   never add it to FastInit's info cleanup. File reading and decoding remain in Qichi's
   runtime. The adapter covers the known info filename, not arbitrary external packages.
+  Log the runtime request startup separately: its synchronous file read/decode occurs
+  before the Unity async request and must not be described as a non-blocking phase.
   Verify a fresh-process `s_qichi_1_5` entry and its dungeon meshes/materials separately
   from the cross-set `s_zhuzi_2` info dependency regression.
 - The reader targets UnityFS v6 / serialized-file versions 9–21 used by this Unity

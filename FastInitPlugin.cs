@@ -33,7 +33,7 @@ namespace DIYLevelFastInit
     {
         public const string PluginGuid = "oc2.diylevel.fastinit";
         public const string PluginName = "DIYLevel FastInit";
-        public const string PluginVersion = "1.6.9";
+        public const string PluginVersion = "1.6.10";
 
         internal static ManualLogSource Log;
 
@@ -1309,6 +1309,25 @@ namespace DIYLevelFastInit
         }
     }
 
+    /// <summary>Retains a confirmed choice across duplicate frontend requests.</summary>
+    internal sealed class SaveSelectionState
+    {
+        private object _confirmedFlow;
+        internal void Confirm(object flow) { _confirmedFlow = flow; }
+        internal void Reset() { _confirmedFlow = null; }
+        internal bool IsConfirmed(object flow) { return flow != null && ReferenceEquals(flow, _confirmedFlow); }
+        internal bool Reuse(object flow, bool entering, Action reply)
+        {
+            if (!IsConfirmed(flow)) return false;
+            if (!entering) reply();
+            return true;
+        }
+        internal static IEnumerator CloseWhenReady(Func<bool> current, Func<bool> close)
+        {
+            while (current() && !close()) yield return null;
+        }
+    }
+
     /// <summary>Defers only remote DIY level messages before any level-load callback runs.</summary>
     internal static class ClientLoadGate
     {
@@ -1413,11 +1432,10 @@ namespace DIYLevelFastInit
                             if (MultiplayerController.IsSynchronisationActive()) controller.StopSynchronisation();
                             controller.SetLatencyMeasurePaused(true);
                         }
-                        OnDemandResources.EndClientSaveSelection();
-                        if (!IsCurrent(request)) continue;
                         if (Queue.AnnounceStart(request, state => _sendState.Invoke(null, new object[] { state })))
                             FastInitPlugin.Log.LogInfo("DIY client loading acknowledged before resources: " + request.Message.m_Scene
                                 + " (" + request.Message.m_StartLoadGameState + ")");
+                        yield return OnDemandResources.FinishSaveSelection(() => IsCurrent(request), "client");
                         if (!IsCurrent(request)) continue;
                         Box<bool> ready = new Box<bool>();
                         yield return FastInitHost.Guard(OnDemandResources.PrepareClientLevel(request.Path, request.Message.m_Scene,
@@ -1455,8 +1473,17 @@ namespace DIYLevelFastInit
                 FastInitPlugin.Log.LogInfo("stale/duplicate DIY client state ignored: " + state);
                 return false;
             }
-            if (Tracing) FastInitPlugin.Log.LogInfo("DIY client state sent: " + state + " [" + _traceScene + "]");
+            if (Tracing || (state == GameState.LoadedCampaignMapSave && OnDemandResources.HasDiySaveSelection))
+                FastInitPlugin.Log.LogInfo("DIY client state sent: " + state + " [" + (_traceScene ?? "frontend")
+                    + ", machine=" + ClientUserSystem.s_LocalMachineId + "]");
             return true;
+        }
+
+        internal static void RepeatSaveReady()
+        {
+            if (ConnectionStatusPublicizer.IsHost() || !ConnectionStatusPublicizer.IsInSession()) return;
+            _sendState.Invoke(null, new object[] { GameState.LoadedCampaignMapSave });
+            FastInitPlugin.Log.LogInfo("DIY client save acknowledgement repeated for an already confirmed choice");
         }
 
         private static bool Tracing { get { return _traceClock != null && _traceClock.ElapsedMilliseconds < 120000; } }
@@ -1477,6 +1504,7 @@ namespace DIYLevelFastInit
 
         private static void DisconnectPrefix(Client __instance, MethodBase __originalMethod)
         {
+            OnDemandResources.ResetSaveSelection();
             if (Tracing) FastInitPlugin.Log.LogInfo("DIY client lifecycle: " + __originalMethod.Name + " [" + _traceScene + "]");
             if ((Queue.Pending != null && ReferenceEquals(Queue.Pending.Peer, __instance))
                 || (_active != null && ReferenceEquals(_active.Peer, __instance))) Cancel("client connection reset/lost");
@@ -1532,7 +1560,7 @@ namespace DIYLevelFastInit
         private static readonly FieldInfo ClientCountdown = AccessTools.Field(typeof(T17FrontendFlow), "m_bShouldClientCountdown");
         private static readonly FieldInfo OnlineSaveDialog = AccessTools.Field(typeof(T17FrontendFlow), "m_OnlineClientSaveDialog");
         private static readonly FieldInfo LocalSaveDialog = AccessTools.Field(typeof(T17FrontendFlow), "m_saveDialog");
-        private static readonly MethodInfo ForceCloseSaveDialog = AccessTools.Method(typeof(SelectSaveDialog), "ForceClose");
+        private static readonly SaveSelectionState SaveSelection = new SaveSelectionState();
         private static int _selectionFrame = -1;
         private static readonly HashSet<SaveSlotElement> SaveReadyCallbacks = new HashSet<SaveSlotElement>();
         private static bool _entryPriorityActive;
@@ -1554,18 +1582,22 @@ namespace DIYLevelFastInit
 
         internal static bool IsTransitioning { get { return _pendingScene != null; } }
         internal static bool IsClientTransition { get { return IsTransitioning && !ConnectionStatusPublicizer.IsHost() && ConnectionStatusPublicizer.IsInSession(); } }
+        internal static bool HasDiySaveSelection { get { return _visibleSaveDialog != null && _visibleSaveDialog.DLC == 15; } }
 
         internal static void Install(Harmony harmony)
         {
-            if (ClientSavePayload == null || ClientCountdown == null || OnlineSaveDialog == null || LocalSaveDialog == null || ForceCloseSaveDialog == null)
+            if (ClientSavePayload == null || ClientCountdown == null || OnlineSaveDialog == null || LocalSaveDialog == null)
                 throw new MissingMemberException("DIY client save transition contract changed");
             ClientLoadGate.Install(harmony);
             Patch(harmony, typeof(DIYLevelAssetBundleManager), "LoadLevelServer", nameof(ServerLoadPrefix), null);
             Patch(harmony, typeof(DIYLevelAssetBundleManager), "LoadLevelClientPatch", nameof(LoadPrefix), null);
             Patch(harmony, typeof(DIYLevelEntryUI), "OnLevelSelected", nameof(SelectionPrefix), null);
             Patch(harmony, typeof(SelectSaveDialog), "Show", nameof(SaveDialogShowPrefix), nameof(SaveDialogShowPostfix));
+            Patch(harmony, typeof(SelectSaveDialog), "Hide", nameof(SaveDialogHidePrefix), nameof(SaveDialogHidePostfix));
+            Patch(harmony, typeof(SelectSaveDialog), "OnDontSaveSelected", null, nameof(DontSavePostfix));
             Patch(harmony, typeof(T17FrontendFlow), "ShowClientSaveDialog", nameof(ClientSaveDialogPrefix), null);
             Patch(harmony, typeof(T17FrontendFlow), "StartClientCountdown", nameof(ClientCountdownPrefix), null);
+            Patch(harmony, typeof(ServerUserSystem), "OnClientGameStateChanged", null, nameof(ServerSaveStatePostfix));
             harmony.Patch(AccessTools.Method(typeof(SaveSlotElement), "OnSaveGameReady"),
                 prefix: new HarmonyMethod(typeof(OnDemandResources), nameof(SaveReadyPrefix)),
                 finalizer: new HarmonyMethod(typeof(OnDemandResources), nameof(SaveReadyFinalizer)));
@@ -2048,6 +2080,10 @@ namespace DIYLevelFastInit
             {
                 yield return null;
                 FastInitPlugin.Log.LogInfo("async level preparation started: " + scene);
+                Func<bool> current = () => FastInitPlugin.Instance != null && _serverPreparing && _pendingScene == scene
+                    && (!ConnectionStatusPublicizer.IsInSession() || ConnectionStatusPublicizer.IsHost());
+                yield return FinishSaveSelection(current, "server");
+                if (!current()) yield break;
                 CancelPreview();
                 ThumbnailCache.ClearMemory();
                 while (_warmLoading || _previewLoading || _catalogBundles != null || ClientLoadGate.Running)
@@ -2088,21 +2124,27 @@ namespace DIYLevelFastInit
             LevelLoadProgress = "client ...";
         }
 
-        internal static void EndClientSaveSelection()
+        internal static IEnumerator FinishSaveSelection(Func<bool> current, string context)
         {
             T17FrontendFlow flow = T17FrontendFlow.Instance;
-            if (flow == null) return;
+            if (flow == null || !current()) yield break;
             GameStateMessage.ClientSavePayload payload = ClientSavePayload.GetValue(flow) as GameStateMessage.ClientSavePayload;
             if (payload != null && payload.DLCID == 15) ClientSavePayload.SetValue(flow, null);
             ClientCountdown.SetValue(flow, false);
+            flow.HideWaitingForPlayers();
             HashSet<SelectSaveDialog> dialogs = new HashSet<SelectSaveDialog> { _visibleSaveDialog,
                 OnlineSaveDialog.GetValue(flow) as SelectSaveDialog, LocalSaveDialog.GetValue(flow) as SelectSaveDialog };
             foreach (SelectSaveDialog dialog in dialogs)
-                if (dialog != null && dialog.DLC == 15 && dialog.gameObject.activeInHierarchy)
-                    ForceCloseSaveDialog.Invoke(dialog, null);
-            flow.HideWaitingForPlayers();
-            FastInitPlugin.Log.LogInfo("DIY client save wait ended before resource preparation");
+            {
+                if (!current()) yield break;
+                if (dialog == null || dialog.DLC != 15) continue;
+                yield return SaveSelectionState.CloseWhenReady(current,
+                    () => dialog == null || !dialog.gameObject.activeSelf || dialog.Hide(false));
+            }
+            if (current()) FastInitPlugin.Log.LogInfo("DIY " + context + " save UI closed before resource preparation");
         }
+
+        internal static void ResetSaveSelection() { SaveSelection.Reset(); }
 
         internal static void EndClientPreparation(bool handedOff)
         {
@@ -2233,13 +2275,14 @@ namespace DIYLevelFastInit
                 return false;
             }
             _selectionFrame = Time.frameCount;
+            SaveSelection.Reset();
             return true;
         }
 
         private static bool SaveDialogShowPrefix(SelectSaveDialog __instance, ref bool __result)
         {
             if (__instance.DLC != 15) return true;
-            if (!IsTransitioning && !__instance.gameObject.activeInHierarchy) return true;
+            if (!IsTransitioning && !SaveSelection.IsConfirmed(T17FrontendFlow.Instance) && !__instance.gameObject.activeInHierarchy) return true;
             __result = false;
             FastInitPlugin.Log.LogInfo("duplicate DIY save dialog ignored: already open or entering a level");
             return false;
@@ -2247,26 +2290,80 @@ namespace DIYLevelFastInit
 
         private static void SaveDialogShowPostfix(SelectSaveDialog __instance, bool __result)
         {
-            if (__result && __instance.DLC == 15) _visibleSaveDialog = __instance;
+            if (!__result || __instance.DLC != 15) return;
+            _visibleSaveDialog = __instance;
+            FastInitPlugin.Log.LogInfo("DIY save dialog opened: id=" + __instance.GetInstanceID() + ", frame=" + Time.frameCount);
+        }
+
+        private static void SaveDialogHidePrefix(SelectSaveDialog __instance, ref bool restoreInvokerState, out bool __state)
+        {
+            __state = __instance.DLC == 15 && __instance.gameObject.activeSelf;
+            if (__instance.DLC == 15 && IsTransitioning) restoreInvokerState = false;
+        }
+
+        private static void SaveDialogHidePostfix(SelectSaveDialog __instance, bool __state, bool __result)
+        {
+            if (__state && __result) FastInitPlugin.Log.LogInfo("DIY save dialog closed: id=" + __instance.GetInstanceID()
+                + ", entering=" + IsTransitioning + ", frame=" + Time.frameCount);
+        }
+
+        private static void ConfirmSaveSelection()
+        {
+            T17FrontendFlow flow = T17FrontendFlow.Instance;
+            if (flow == null) return;
+            SaveSelection.Confirm(flow);
+            ClientCountdown.SetValue(flow, false);
+            FastInitPlugin.Log.LogInfo("DIY save choice confirmed; client save countdown stopped");
+        }
+
+        private static void DontSavePostfix(SelectSaveDialog __instance)
+        {
+            if (__instance.DLC == 15) ConfirmSaveSelection();
+        }
+
+        private static void ServerSaveStatePostfix(Serialisable message)
+        {
+            GameStateMessage state = message as GameStateMessage;
+            if (state == null || state.m_State != GameState.LoadedCampaignMapSave || !HasDiySaveSelection) return;
+            List<string> users = new List<string>();
+            for (int i = 0; i < ServerUserSystem.m_Users.Count; i++)
+            {
+                User user = ServerUserSystem.m_Users._items[i];
+                users.Add(user.Machine + "/" + user.Engagement + "=" + user.GameState);
+            }
+            FastInitPlugin.Log.LogInfo("DIY server save acknowledgement received: machine=" + state.m_Machine
+                + ", users=" + string.Join(", ", users.ToArray()));
         }
 
         private static bool ClientSaveDialogPrefix(T17FrontendFlow __instance)
         {
             GameStateMessage.ClientSavePayload payload = ClientSavePayload.GetValue(__instance) as GameStateMessage.ClientSavePayload;
             if (payload == null || payload.DLCID != 15) return true;
+            if (SaveSelection.IsConfirmed(__instance))
+            {
+                ClientSavePayload.SetValue(__instance, null);
+                ClientCountdown.SetValue(__instance, false);
+                SaveSelection.Reuse(__instance, IsTransitioning, ClientLoadGate.RepeatSaveReady);
+                FastInitPlugin.Log.LogInfo("duplicate DIY client save request reused the confirmed choice");
+                return false;
+            }
             if (!IsTransitioning && (_visibleSaveDialog == null || !_visibleSaveDialog.gameObject.activeInHierarchy)) return true;
             ClientSavePayload.SetValue(__instance, null);
             FastInitPlugin.Log.LogInfo("duplicate DIY client save request ignored: already open or entering a level");
             return false;
         }
 
-        private static bool ClientCountdownPrefix() { return !IsClientTransition; }
+        private static bool ClientCountdownPrefix()
+        {
+            return !IsClientTransition && !SaveSelection.IsConfirmed(T17FrontendFlow.Instance);
+        }
 
         private static bool SaveReadyPrefix(SaveSlotElement __instance, out bool __state)
         {
             __state = false;
             if (__instance.DLC != 15) return true;
-            if (__instance.SaveGameReady || IsTransitioning || !SaveReadyCallbacks.Add(__instance))
+            if (__instance.SaveGameReady || IsTransitioning || SaveSelection.IsConfirmed(T17FrontendFlow.Instance)
+                || SaveReadyCallbacks.Count != 0 || !SaveReadyCallbacks.Add(__instance))
             {
                 FastInitPlugin.Log.LogInfo("duplicate DIY save confirmation ignored");
                 return false;
@@ -2277,7 +2374,11 @@ namespace DIYLevelFastInit
 
         private static Exception SaveReadyFinalizer(SaveSlotElement __instance, bool __state, Exception __exception)
         {
-            if (__state) SaveReadyCallbacks.Remove(__instance);
+            if (__state)
+            {
+                SaveReadyCallbacks.Remove(__instance);
+                if (__exception == null && __instance.SaveGameReady) ConfirmSaveSelection();
+            }
             return __exception;
         }
 
@@ -2432,11 +2533,12 @@ namespace DIYLevelFastInit
             {
                 _pendingScene = null;
                 CancelPreview();
+                SaveSelection.Reset();
+                _visibleSaveDialog = null;
             }
             if (frontend)
             {
                 ClientLoadGate.Cancel("frontend scene loaded");
-                _visibleSaveDialog = null;
                 _selectionFrame = -1;
             }
             ReleaseUnused();
@@ -3039,7 +3141,9 @@ namespace DIYLevelFastInit
             if (bundle != null) { Adopt(bundle, null); return null; }
             if ((bool)_loading.GetValue(null)) throw new IOException("Qichi runtime is loading without a resource request");
             _loaded.SetValue(null, false);
+            System.Diagnostics.Stopwatch timer = System.Diagnostics.Stopwatch.StartNew();
             _start.Invoke(null, null);
+            FastInitPlugin.Log.LogInfo("Qichi runtime request startup: " + timer.ElapsedMilliseconds + " ms before async wait");
             request = _request.GetValue(null) as AssetBundleCreateRequest;
             if (request == null) throw new IOException("Qichi runtime could not start loading qichi_assets");
             FastInitPlugin.Log.LogInfo("Qichi dependency loading: qichi_assets (runtime request)");
