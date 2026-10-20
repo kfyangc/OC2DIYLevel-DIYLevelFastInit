@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35, single file `FastInitPlugin.cs`) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.7 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.8 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -93,12 +93,27 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   separate from `_serverPreparing`, which ends at the original scene-load handoff.
   Bundle and info-asset phase timers plus handoff-to-scene timing support comparisons;
   priority changes do not guarantee instant entry and may reduce loading-time frame rate.
-- `LoadPrefix` / `PrepareLevel` remain synchronous for `LoadLevelClientPatch`.
-  OC2DIYLevel calls it from a prefix on `NetworkUtils.LevelLoadByName`; returning early
-  would let the original network handler consume incomplete session/level settings.
-  Both paths share session-directory validation and individual variant construction.
-  Do not generalize the server's asynchronous deferral to the client void method.
-  One expensive configuration and native scene activation can still cause a frame spike.
+- `ClientLoadGate` defers reliable remote DIY `LevelLoadByName` messages at
+  `Mailbox.OnMessageReceived`, before any callback or OC2DIYLevel prefix runs. Snapshot
+  all four message fields and the sender/sequence/reliability envelope: the game registry
+  reuses mutable message instances. Do not retain a borrowed payload or merely return
+  early from `LoadLevelClientPatch`. The latter remains synchronous for replay and direct
+  callers, so the original handler always consumes complete session/level settings.
+- `ClientLoadQueue` coalesces pending duplicates, keeps the newest target, and permits
+  one scoped replay. A request belongs to the exact client mailbox, peer and connection;
+  check identity and the remote-client role after native waits and before replay. Cancel
+  on client reset/loss/kick, non-DIY scene messages, frontend arrival and plugin shutdown.
+  Drain uncancellable native requests before clearing `_clientPreparingBundles`; pin them
+  independently of server preparation. Restore a client latency pause on failed/cancelled
+  preparation only while its connection still matches. Leave unrelated mailbox traffic,
+  vanilla levels and host loopback on their original paths.
+- `PrepareResources` shares async bundle/info preparation and per-frame configuration
+  factories between server and gated client entry. Keep `_directoryBuild` scoped to each
+  synchronous factory. A complex individual config or scene activation may still spike.
+- Save-dialog guards cover DLC 15 only: suppress same-frame selection reentry, an already
+  visible dialog, dialog reopening during entry, and repeated `OnSaveGameReady` callbacks.
+  Clear duplicate frontend save payloads when suppressing their show attempt, so Update
+  does not retry them indefinitely. A cancelled dialog and a new frontend allow reselection.
 - Public `levelSetInfos` entries remain lightweight SOs with stable identities; full
   `LoadedSet.Info` objects stay private. The directory remains complete for save IDs,
   original dependency lookup, sorting and arcade selection. Never replace it with a

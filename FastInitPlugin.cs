@@ -11,6 +11,11 @@ using HarmonyLib;
 using LevelEditorStub;
 using OC2DIYLevel;
 using OC2DIYLevel.CustomArcade;
+using OC2DIYLevel.Extension;
+using Team17.Online;
+using Team17.Online.Multiplayer;
+using Team17.Online.Multiplayer.Connection;
+using Team17.Online.Multiplayer.Messaging;
 using UnityEngine;
 using UnityEngine.UI;
 using UnityEngine.SceneManagement;
@@ -28,7 +33,7 @@ namespace DIYLevelFastInit
     {
         public const string PluginGuid = "oc2.diylevel.fastinit";
         public const string PluginName = "DIYLevel FastInit";
-        public const string PluginVersion = "1.6.7";
+        public const string PluginVersion = "1.6.8";
 
         internal static ManualLogSource Log;
 
@@ -104,6 +109,7 @@ namespace DIYLevelFastInit
 
         private void OnDestroy()
         {
+            ClientLoadGate.Cancel("plugin shutdown");
             OnDemandResources.RestoreEntryPriority("plugin shutdown");
         }
 
@@ -1242,6 +1248,187 @@ namespace DIYLevelFastInit
         }
     }
 
+    /// <summary>Owns deferred message copies and permits one delivery of the current request.</summary>
+    internal sealed class ClientLoadQueue
+    {
+        internal sealed class Request
+        {
+            internal object Mailbox, Peer, Connection;
+            internal IOnlineMultiplayerSessionUserId Sender;
+            internal LevelLoadByNameMessage Message;
+            internal string Path;
+            internal uint Sequence;
+            internal bool Reliable;
+        }
+
+        internal Request Pending, Replaying;
+
+        internal bool Enqueue(object mailbox, object peer, object connection, IOnlineMultiplayerSessionUserId sender,
+            LevelLoadByNameMessage message, string path, uint sequence, bool reliable)
+        {
+            Request old = Pending;
+            if (old != null && ReferenceEquals(old.Mailbox, mailbox) && ReferenceEquals(old.Peer, peer) && ReferenceEquals(old.Connection, connection)
+                && old.Message.m_Scene == message.m_Scene && old.Message.m_StartLoadGameState == message.m_StartLoadGameState
+                && old.Message.m_HideLoadingScreenGameState == message.m_HideLoadingScreenGameState
+                && old.Message.UseLoadingScreen == message.UseLoadingScreen) return false;
+            LevelLoadByNameMessage copy = new LevelLoadByNameMessage();
+            copy.Initialise(message.m_StartLoadGameState, message.m_HideLoadingScreenGameState, message.m_Scene, message.UseLoadingScreen);
+            Pending = new Request { Mailbox = mailbox, Peer = peer, Connection = connection, Sender = sender,
+                Message = copy, Path = path, Sequence = sequence, Reliable = reliable };
+            return true;
+        }
+
+        internal bool IsCurrent(Request request) { return request != null && ReferenceEquals(Pending, request); }
+        internal void Cancel() { Pending = null; }
+
+        internal bool Deliver(Request request, Action<Request> dispatch)
+        {
+            if (!IsCurrent(request) || Replaying != null) return false;
+            Replaying = request;
+            try { dispatch(request); return true; }
+            finally
+            {
+                Replaying = null;
+                if (IsCurrent(request)) Pending = null;
+            }
+        }
+    }
+
+    /// <summary>Defers only remote DIY level messages before any level-load callback runs.</summary>
+    internal static class ClientLoadGate
+    {
+        private static readonly ClientLoadQueue Queue = new ClientLoadQueue();
+        private static FieldInfo _clientMailbox, _mailboxPeer;
+        private static readonly FieldInfo ServerConnection = AccessTools.Field(typeof(Client), "m_ServerConnection");
+        private static MethodInfo _receive;
+        private static ClientLoadQueue.Request _active;
+        internal static bool Running;
+
+        internal static void Install(Harmony harmony)
+        {
+            Type mailbox = typeof(NetworkUtils).Assembly.GetType("Mailbox", true);
+            _clientMailbox = AccessTools.Field(mailbox, "Client");
+            _mailboxPeer = AccessTools.Field(mailbox, "m_Peer");
+            _receive = AccessTools.Method(mailbox, "OnMessageReceived");
+            if (_clientMailbox == null || _mailboxPeer == null || _receive == null || ServerConnection == null)
+                throw new MissingMemberException("DIY client mailbox contract changed");
+            harmony.Patch(_receive, prefix: new HarmonyMethod(typeof(ClientLoadGate), nameof(ReceivePrefix)));
+            foreach (string method in new[] { "Reset", "HandleConnectionLost", "HandleLocalLoopbackConnectionLost", "HandleDisconnectMessage" })
+                harmony.Patch(AccessTools.Method(typeof(Client), method),
+                    prefix: new HarmonyMethod(typeof(ClientLoadGate), nameof(DisconnectPrefix)));
+        }
+
+        private static bool ReceivePrefix(object __instance, IOnlineMultiplayerSessionUserId sessionUserId,
+            MessageType type, Serialisable message, uint sequence, bool bReliable)
+        {
+            if (type != MessageType.LevelLoadByName && type != MessageType.LevelLoadByIndex) return true;
+            if (!ReferenceEquals(__instance, _clientMailbox.GetValue(null))) return true;
+            if (Queue.Replaying != null && ReferenceEquals(message, Queue.Replaying.Message)) return true;
+            if (ConnectionStatusPublicizer.IsHost() || !ConnectionStatusPublicizer.IsInSession()) return true;
+            if (!DIYLevelAssetBundleManager.IsInitialized || !bReliable) return true;
+            LevelLoadByNameMessage level = message as LevelLoadByNameMessage;
+            string path;
+            if (level == null || !OnDemandResources.TryFindScenePath(level.m_Scene, out path))
+            {
+                Cancel("another scene requested");
+                return true;
+            }
+            if (FastInitPlugin.Instance == null) return true;
+            Client peer = _mailboxPeer.GetValue(__instance) as Client;
+            NetworkConnection connection = peer == null ? null : ServerConnection.GetValue(peer) as NetworkConnection;
+            if (connection == null) return true;
+            if (!Queue.Enqueue(__instance, peer, connection, sessionUserId, level, path, sequence, bReliable))
+            {
+                FastInitPlugin.Log.LogDebug("duplicate DIY client level message ignored: " + level.m_Scene);
+                return false;
+            }
+            OnDemandResources.BeginClientPreparation(level.m_Scene);
+            FastInitPlugin.Log.LogInfo("DIY client level message deferred: " + level.m_Scene);
+            if (!Running)
+            {
+                Running = true;
+                FastInitPlugin.Instance.StartCoroutine(FastInitHost.Guard(Prepare(), "DIY client level queue"));
+            }
+            return false;
+        }
+
+        private static bool IsCurrent(ClientLoadQueue.Request request)
+        {
+            return Queue.IsCurrent(request) && FastInitPlugin.Instance != null
+                && !ConnectionStatusPublicizer.IsHost() && ConnectionStatusPublicizer.IsInSession()
+                && ReferenceEquals(_clientMailbox.GetValue(null), request.Mailbox)
+                && ReferenceEquals(_mailboxPeer.GetValue(request.Mailbox), request.Peer)
+                && ReferenceEquals(ServerConnection.GetValue(request.Peer), request.Connection);
+        }
+
+        private static IEnumerator Prepare()
+        {
+            bool handedOff = false;
+            try
+            {
+                while (Queue.Pending != null)
+                {
+                    handedOff = false;
+                    ClientLoadQueue.Request request = Queue.Pending;
+                    _active = request;
+                    yield return null;
+                    if (!IsCurrent(request))
+                    {
+                        if (Queue.IsCurrent(request)) Queue.Cancel();
+                        continue;
+                    }
+                    NetworkConnection connection = (NetworkConnection)request.Connection;
+                    bool paused = connection.GetLatencyTestPaused();
+                    MultiplayerController controller = GameUtils.RequestManager<MultiplayerController>();
+                    try
+                    {
+                        if (controller != null)
+                        {
+                            if (MultiplayerController.IsSynchronisationActive()) controller.StopSynchronisation();
+                            controller.SetLatencyMeasurePaused(true);
+                        }
+                        Box<bool> ready = new Box<bool>();
+                        yield return FastInitHost.Guard(OnDemandResources.PrepareClientLevel(request.Path, request.Message.m_Scene,
+                            () => IsCurrent(request), ready), "DIY client preparation [" + request.Message.m_Scene + "]");
+                        if (ready.Value && IsCurrent(request))
+                        {
+                            handedOff = Queue.Deliver(request, item => _receive.Invoke(item.Mailbox, new object[]
+                                { item.Sender, MessageType.LevelLoadByName, item.Message, item.Sequence, item.Reliable }));
+                            FastInitPlugin.Log.LogInfo("DIY client level message resumed: " + request.Message.m_Scene);
+                        }
+                    }
+                    finally
+                    {
+                        if (Queue.IsCurrent(request)) Queue.Cancel();
+                        if (!handedOff && !paused && controller != null
+                            && ReferenceEquals(ServerConnection.GetValue(request.Peer), request.Connection))
+                            controller.SetLatencyMeasurePaused(false);
+                    }
+                }
+            }
+            finally
+            {
+                Queue.Cancel();
+                _active = null;
+                Running = false;
+                OnDemandResources.EndClientPreparation(handedOff);
+            }
+        }
+
+        private static void DisconnectPrefix(Client __instance)
+        {
+            if ((Queue.Pending != null && ReferenceEquals(Queue.Pending.Peer, __instance))
+                || (_active != null && ReferenceEquals(_active.Peer, __instance))) Cancel("client connection reset/lost");
+        }
+
+        internal static void Cancel(string reason)
+        {
+            if (Queue.Pending == null) return;
+            FastInitPlugin.Log.LogInfo("DIY client level preparation cancelled: " + reason);
+            Queue.Cancel();
+        }
+    }
+
     internal static class OnDemandResources
     {
         private sealed class LoadedSet
@@ -1277,7 +1464,12 @@ namespace DIYLevelFastInit
         private static int _warmGeneration;
         private static HashSet<string> _warmBundles;
         private static HashSet<string> _preparingBundles;
+        private static HashSet<string> _clientPreparingBundles;
         private static bool _serverPreparing, _resumeServerLoad;
+        private static SelectSaveDialog _visibleSaveDialog;
+        private static readonly FieldInfo ClientSavePayload = AccessTools.Field(typeof(T17FrontendFlow), "m_ClientSavePayload");
+        private static int _selectionFrame = -1;
+        private static readonly HashSet<SaveSlotElement> SaveReadyCallbacks = new HashSet<SaveSlotElement>();
         private static bool _entryPriorityActive;
         private static UnityEngine.ThreadPriority _previousEntryPriority;
         private static string _entryPriorityScene;
@@ -1299,9 +1491,16 @@ namespace DIYLevelFastInit
 
         internal static void Install(Harmony harmony)
         {
+            if (ClientSavePayload == null) throw new MissingFieldException("T17FrontendFlow.m_ClientSavePayload");
+            ClientLoadGate.Install(harmony);
             Patch(harmony, typeof(DIYLevelAssetBundleManager), "LoadLevelServer", nameof(ServerLoadPrefix), null);
             Patch(harmony, typeof(DIYLevelAssetBundleManager), "LoadLevelClientPatch", nameof(LoadPrefix), null);
             Patch(harmony, typeof(DIYLevelEntryUI), "OnLevelSelected", nameof(SelectionPrefix), null);
+            Patch(harmony, typeof(SelectSaveDialog), "Show", nameof(SaveDialogShowPrefix), nameof(SaveDialogShowPostfix));
+            Patch(harmony, typeof(T17FrontendFlow), "ShowClientSaveDialog", nameof(ClientSaveDialogPrefix), null);
+            harmony.Patch(AccessTools.Method(typeof(SaveSlotElement), "OnSaveGameReady"),
+                prefix: new HarmonyMethod(typeof(OnDemandResources), nameof(SaveReadyPrefix)),
+                finalizer: new HarmonyMethod(typeof(OnDemandResources), nameof(SaveReadyFinalizer)));
             Patch(harmony, typeof(RuntimePrefabManager), "ClearAllRuntimePrefabs", nameof(ClearPrefix), null);
             Patch(harmony, typeof(RuntimePrefabManager), "CloneAsInactivePrefab", null, nameof(ClonePostfix));
             harmony.Patch(AccessTools.Method(typeof(LevelConfigSetup), "SetupConfig"),
@@ -1766,6 +1965,7 @@ namespace DIYLevelFastInit
             }
             if (FastInitPlugin.Instance == null) { LoadPrefix(sceneName); return true; }
             string path = FindScenePath(sceneName);
+            ClientLoadGate.Cancel("server level entry");
             _pendingScene = sceneName;
             _serverPreparing = true;
             LevelLoadProgress = "...";
@@ -1776,61 +1976,20 @@ namespace DIYLevelFastInit
         private static IEnumerator PrepareServerLevel(string path, string scene)
         {
             bool resumed = false;
-            System.Diagnostics.Stopwatch timer = System.Diagnostics.Stopwatch.StartNew();
             try
             {
                 yield return null;
                 FastInitPlugin.Log.LogInfo("async level preparation started: " + scene);
                 CancelPreview();
                 ThumbnailCache.ClearMemory();
-                while (_warmLoading || _previewLoading || _catalogBundles != null) yield return null;
-                BoostEntryPriority(scene);
-                ReleaseUnused();
-                List<FileInfo> files = FastInitHost.SafeGetFiles(new DirectoryInfo(path), "info*");
-                if (files.Count == 0) throw new FileNotFoundException("Missing info bundle", path);
-                _preparingBundles = InfoBundleGraph.Required(files[0].FullName, Path.Combine(path, scene));
-                foreach (string required in _preparingBundles)
+                while (_warmLoading || _previewLoading || _catalogBundles != null || ClientLoadGate.Running)
                 {
-                    bool resident = InfoBundles.ContainsKey(required);
-                    System.Diagnostics.Stopwatch bundleTimer = System.Diagnostics.Stopwatch.StartNew();
-                    yield return EnsureInfoBundleAsync(required, 10);
-                    FastInitPlugin.Log.LogInfo("level bundle ready: " + Path.GetFileName(required) + " ("
-                        + (resident ? "resident" : "async") + ", " + bundleTimer.ElapsedMilliseconds + " ms elapsed)");
-                }
-                LoadedSet set;
-                if (!Sets.TryGetValue(path, out set))
-                {
-                    Box<LevelSetInfoSO> info = new Box<LevelSetInfoSO>();
-                    try
-                    {
-                        AssetBundle bundle = InfoBundles[files[0].FullName];
-                        System.Diagnostics.Stopwatch assetTimer = System.Diagnostics.Stopwatch.StartNew();
-                        yield return EnsureInfoAssetAsync(path, bundle, info, 10);
-                        FastInitPlugin.Log.LogInfo("level info asset ready: " + scene + " (" + assetTimer.ElapsedMilliseconds + " ms elapsed)");
-                        set = new LoadedSet { Bundle = bundle, Info = info.Value };
-                        set.Required.UnionWith(InfoBundleGraph.Required(files[0].FullName, null));
-                        Sets.Add(path, set);
-                        FastInitPlugin.Log.LogInfo("on-demand info loaded: " + Path.GetFileName(path) + " (" + InfoBundles.Count + " bundles tracked, async level entry)");
-                    }
-                    finally { info.Value = null; }
-                }
-                set.SceneDependencies[scene] = _preparingBundles;
-                FastInitPlugin.Log.LogInfo("async level resources ready: " + scene + " (" + timer.ElapsedMilliseconds + " ms elapsed)");
-                LevelLoadProgress = "0/4";
-                LevelInfoSO full = Resolve(path, scene);
-                SceneDirectoryData.SceneDirectoryEntry entry = PrepareSessionEntry(scene);
-                entry.LoadScreenOverride = full.screenshot;
-                for (int i = 0; i < entry.SceneVarients.Length; i++)
-                {
-                    System.Diagnostics.Stopwatch configTimer = System.Diagnostics.Stopwatch.StartNew();
-                    PrepareVariant(full, entry.SceneVarients[i]);
-                    LevelLoadProgress = (i + 1) + "/" + entry.SceneVarients.Length;
-                    string timing = "level config prepared: " + scene + " (" + (i + 1) + "p, " + configTimer.ElapsedMilliseconds + " ms)";
-                    if (configTimer.ElapsedMilliseconds >= 50) FastInitPlugin.Log.LogInfo(timing);
-                    else FastInitPlugin.Log.LogDebug(timing);
+                    if (ConnectionStatusPublicizer.IsInSession() && !ConnectionStatusPublicizer.IsHost()) yield break;
                     yield return null;
                 }
-                FastInitPlugin.Log.LogInfo("on-demand config ready: " + scene + " (" + Levels.Count + " levels retained, async level entry, " + timer.ElapsedMilliseconds + " ms elapsed)");
+                BoostEntryPriority(scene);
+                yield return PrepareResources(path, scene, null);
+                if (ConnectionStatusPublicizer.IsInSession() && !ConnectionStatusPublicizer.IsHost()) yield break;
                 try
                 {
                     _resumeServerLoad = true;
@@ -1842,16 +2001,118 @@ namespace DIYLevelFastInit
             }
             finally
             {
-                LevelLoadProgress = null;
+                if (!ClientLoadGate.Running) LevelLoadProgress = null;
                 _serverPreparing = false;
                 _preparingBundles = null;
                 if (!resumed)
                 {
-                    _pendingScene = null;
+                    if (!ClientLoadGate.Running) _pendingScene = null;
                     RestoreEntryPriority("preparation interrupted");
                 }
                 ReleaseUnused();
             }
+        }
+
+        internal static void BeginClientPreparation(string scene)
+        {
+            _pendingScene = scene;
+            CancelPreview();
+            LevelLoadProgress = "client ...";
+        }
+
+        internal static void EndClientPreparation(bool handedOff)
+        {
+            if (!_serverPreparing)
+            {
+                LevelLoadProgress = null;
+                if (!handedOff) _pendingScene = null;
+            }
+            ReleaseUnused();
+        }
+
+        internal static IEnumerator PrepareClientLevel(string path, string scene, Func<bool> current, Box<bool> ready)
+        {
+            yield return null;
+            if (!current()) yield break;
+            FastInitPlugin.Log.LogInfo("async client level preparation started: " + scene);
+            ThumbnailCache.ClearMemory();
+            while (_warmLoading || _previewLoading || _catalogBundles != null || _serverPreparing)
+            {
+                if (!current()) yield break;
+                yield return null;
+            }
+            try
+            {
+                yield return PrepareResources(path, scene, current);
+                ready.Value = current();
+            }
+            finally
+            {
+                _clientPreparingBundles = null;
+                ReleaseUnused();
+            }
+        }
+
+        private static IEnumerator PrepareResources(string path, string scene, Func<bool> current)
+        {
+            bool client = current != null;
+            string context = client ? "client " : "";
+            System.Diagnostics.Stopwatch timer = System.Diagnostics.Stopwatch.StartNew();
+            if (client && !current()) yield break;
+            ReleaseUnused();
+            List<FileInfo> files = FastInitHost.SafeGetFiles(new DirectoryInfo(path), "info*");
+            if (files.Count == 0) throw new FileNotFoundException("Missing info bundle", path);
+            HashSet<string> requiredBundles = InfoBundleGraph.Required(files[0].FullName, Path.Combine(path, scene));
+            if (client) _clientPreparingBundles = requiredBundles;
+            else _preparingBundles = requiredBundles;
+            foreach (string required in requiredBundles)
+            {
+                if (client && !current()) yield break;
+                bool resident = InfoBundles.ContainsKey(required);
+                System.Diagnostics.Stopwatch bundleTimer = System.Diagnostics.Stopwatch.StartNew();
+                yield return EnsureInfoBundleAsync(required, 10);
+                if (client && !current()) yield break;
+                FastInitPlugin.Log.LogInfo(context + "level bundle ready: " + Path.GetFileName(required) + " ("
+                    + (resident ? "resident" : "async") + ", " + bundleTimer.ElapsedMilliseconds + " ms elapsed)");
+            }
+            LoadedSet set;
+            if (!Sets.TryGetValue(path, out set))
+            {
+                Box<LevelSetInfoSO> info = new Box<LevelSetInfoSO>();
+                try
+                {
+                    AssetBundle bundle = InfoBundles[files[0].FullName];
+                    System.Diagnostics.Stopwatch assetTimer = System.Diagnostics.Stopwatch.StartNew();
+                    yield return EnsureInfoAssetAsync(path, bundle, info, 10);
+                    if (client && !current()) yield break;
+                    FastInitPlugin.Log.LogInfo(context + "level info asset ready: " + scene + " (" + assetTimer.ElapsedMilliseconds + " ms elapsed)");
+                    set = new LoadedSet { Bundle = bundle, Info = info.Value };
+                    set.Required.UnionWith(InfoBundleGraph.Required(files[0].FullName, null));
+                    Sets.Add(path, set);
+                    FastInitPlugin.Log.LogInfo("on-demand info loaded: " + Path.GetFileName(path) + " ("
+                        + InfoBundles.Count + " bundles tracked, async " + context + "level entry)");
+                }
+                finally { info.Value = null; }
+            }
+            set.SceneDependencies[scene] = requiredBundles;
+            FastInitPlugin.Log.LogInfo("async " + context + "level resources ready: " + scene + " (" + timer.ElapsedMilliseconds + " ms elapsed)");
+            LevelLoadProgress = context + "0/4";
+            LevelInfoSO full = Resolve(path, scene);
+            SceneDirectoryData.SceneDirectoryEntry entry = PrepareSessionEntry(scene);
+            entry.LoadScreenOverride = full.screenshot;
+            for (int i = 0; i < entry.SceneVarients.Length; i++)
+            {
+                if (client && !current()) yield break;
+                System.Diagnostics.Stopwatch configTimer = System.Diagnostics.Stopwatch.StartNew();
+                PrepareVariant(full, entry.SceneVarients[i]);
+                LevelLoadProgress = context + (i + 1) + "/" + entry.SceneVarients.Length;
+                string timing = context + "level config prepared: " + scene + " (" + (i + 1) + "p, " + configTimer.ElapsedMilliseconds + " ms)";
+                if (configTimer.ElapsedMilliseconds >= 50) FastInitPlugin.Log.LogInfo(timing);
+                else FastInitPlugin.Log.LogDebug(timing);
+                yield return null;
+            }
+            FastInitPlugin.Log.LogInfo("on-demand config ready: " + scene + " (" + Levels.Count + " levels retained, async "
+                + context + "level entry, " + timer.ElapsedMilliseconds + " ms elapsed)");
         }
 
         private static void BoostEntryPriority(string scene)
@@ -1879,14 +2140,77 @@ namespace DIYLevelFastInit
             _entryPriorityTimer = null;
         }
 
-        private static bool SelectionPrefix() { return !FastInitPlugin.Syncing && !IsTransitioning && _catalogBundles == null; }
+        private static bool SelectionPrefix()
+        {
+            if (FastInitPlugin.Syncing || IsTransitioning || _catalogBundles != null) return false;
+            if (_selectionFrame == Time.frameCount || (_visibleSaveDialog != null && _visibleSaveDialog.gameObject.activeInHierarchy))
+            {
+                FastInitPlugin.Log.LogInfo("duplicate DIY level selection ignored: save dialog already opening/open");
+                return false;
+            }
+            _selectionFrame = Time.frameCount;
+            return true;
+        }
+
+        private static bool SaveDialogShowPrefix(SelectSaveDialog __instance, ref bool __result)
+        {
+            if (__instance.DLC != 15) return true;
+            if (!IsTransitioning && !__instance.gameObject.activeInHierarchy) return true;
+            __result = false;
+            FastInitPlugin.Log.LogInfo("duplicate DIY save dialog ignored: already open or entering a level");
+            return false;
+        }
+
+        private static void SaveDialogShowPostfix(SelectSaveDialog __instance, bool __result)
+        {
+            if (__result && __instance.DLC == 15) _visibleSaveDialog = __instance;
+        }
+
+        private static bool ClientSaveDialogPrefix(T17FrontendFlow __instance)
+        {
+            GameStateMessage.ClientSavePayload payload = ClientSavePayload.GetValue(__instance) as GameStateMessage.ClientSavePayload;
+            if (payload == null || payload.DLCID != 15) return true;
+            if (!IsTransitioning && (_visibleSaveDialog == null || !_visibleSaveDialog.gameObject.activeInHierarchy)) return true;
+            ClientSavePayload.SetValue(__instance, null);
+            FastInitPlugin.Log.LogInfo("duplicate DIY client save request ignored: already open or entering a level");
+            return false;
+        }
+
+        private static bool SaveReadyPrefix(SaveSlotElement __instance, out bool __state)
+        {
+            __state = false;
+            if (__instance.DLC != 15) return true;
+            if (__instance.SaveGameReady || IsTransitioning || !SaveReadyCallbacks.Add(__instance))
+            {
+                FastInitPlugin.Log.LogInfo("duplicate DIY save confirmation ignored");
+                return false;
+            }
+            __state = true;
+            return true;
+        }
+
+        private static Exception SaveReadyFinalizer(SaveSlotElement __instance, bool __state, Exception __exception)
+        {
+            if (__state) SaveReadyCallbacks.Remove(__instance);
+            return __exception;
+        }
+
+        internal static bool TryFindScenePath(string scene, out string path)
+        {
+            List<KeyValuePair<string, LevelSetInfoSO>> catalog = DIYLevelAssetBundleManager.levelSetInfos;
+            if (catalog != null)
+                foreach (KeyValuePair<string, LevelSetInfoSO> set in catalog)
+                    foreach (LevelInfoSO info in set.Value.levelInfos)
+                        if (string.Equals(info.sceneName, scene, StringComparison.OrdinalIgnoreCase))
+                        { path = set.Key; return true; }
+            path = null;
+            return false;
+        }
 
         private static string FindScenePath(string scene)
         {
-            foreach (KeyValuePair<string, LevelSetInfoSO> set in DIYLevelAssetBundleManager.levelSetInfos)
-                foreach (LevelInfoSO info in set.Value.levelInfos)
-                    if (string.Equals(info.sceneName, scene, StringComparison.OrdinalIgnoreCase))
-                        return set.Key;
+            string path;
+            if (TryFindScenePath(scene, out path)) return path;
             throw new InvalidOperationException("DIY level not found in catalog: " + scene);
         }
 
@@ -2023,6 +2347,12 @@ namespace DIYLevelFastInit
                 _pendingScene = null;
                 CancelPreview();
             }
+            if (frontend)
+            {
+                ClientLoadGate.Cancel("frontend scene loaded");
+                _visibleSaveDialog = null;
+                _selectionFrame = -1;
+            }
             ReleaseUnused();
             if (frontend) RequestCleanup();
             if (Levels.ContainsKey(scene.name) && FastInitPlugin.Instance != null)
@@ -2136,6 +2466,7 @@ namespace DIYLevelFastInit
             if (_previewBundles != null) retained.UnionWith(_previewBundles);
             if (_warmBundles != null) retained.UnionWith(_warmBundles);
             if (_preparingBundles != null) retained.UnionWith(_preparingBundles);
+            if (_clientPreparingBundles != null) retained.UnionWith(_clientPreparingBundles);
             foreach (LoadedSet set in Sets.Values)
             {
                 retained.UnionWith(set.Required);
