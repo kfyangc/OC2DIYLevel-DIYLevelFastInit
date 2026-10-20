@@ -33,7 +33,7 @@ namespace DIYLevelFastInit
     {
         public const string PluginGuid = "oc2.diylevel.fastinit";
         public const string PluginName = "DIYLevel FastInit";
-        public const string PluginVersion = "1.6.8";
+        public const string PluginVersion = "1.6.9";
 
         internal static ManualLogSource Log;
 
@@ -1259,6 +1259,7 @@ namespace DIYLevelFastInit
             internal string Path;
             internal uint Sequence;
             internal bool Reliable;
+            internal bool StartAnnounced;
         }
 
         internal Request Pending, Replaying;
@@ -1281,6 +1282,20 @@ namespace DIYLevelFastInit
         internal bool IsCurrent(Request request) { return request != null && ReferenceEquals(Pending, request); }
         internal void Cancel() { Pending = null; }
 
+        internal bool AnnounceStart(Request request, Action<GameState> send)
+        {
+            if (!IsCurrent(request) || request.StartAnnounced) return false;
+            send(request.Message.m_StartLoadGameState);
+            request.StartAnnounced = true;
+            return true;
+        }
+
+        internal bool AllowsState(GameState state)
+        {
+            if (Pending != null && state == GameState.LoadedCampaignMapSave) return false;
+            return Replaying == null || !Replaying.StartAnnounced || state != Replaying.Message.m_StartLoadGameState;
+        }
+
         internal bool Deliver(Request request, Action<Request> dispatch)
         {
             if (!IsCurrent(request) || Replaying != null) return false;
@@ -1301,7 +1316,10 @@ namespace DIYLevelFastInit
         private static FieldInfo _clientMailbox, _mailboxPeer;
         private static readonly FieldInfo ServerConnection = AccessTools.Field(typeof(Client), "m_ServerConnection");
         private static MethodInfo _receive;
+        private static MethodInfo _sendState;
         private static ClientLoadQueue.Request _active;
+        private static string _traceScene;
+        private static System.Diagnostics.Stopwatch _traceClock;
         internal static bool Running;
 
         internal static void Install(Harmony harmony)
@@ -1310,12 +1328,18 @@ namespace DIYLevelFastInit
             _clientMailbox = AccessTools.Field(mailbox, "Client");
             _mailboxPeer = AccessTools.Field(mailbox, "m_Peer");
             _receive = AccessTools.Method(mailbox, "OnMessageReceived");
-            if (_clientMailbox == null || _mailboxPeer == null || _receive == null || ServerConnection == null)
+            _sendState = AccessTools.Method(typeof(NetworkUtils).Assembly.GetType("ClientMessenger", true), "GameState", new[] { typeof(GameState) });
+            if (_clientMailbox == null || _mailboxPeer == null || _receive == null || ServerConnection == null || _sendState == null)
                 throw new MissingMemberException("DIY client mailbox contract changed");
             harmony.Patch(_receive, prefix: new HarmonyMethod(typeof(ClientLoadGate), nameof(ReceivePrefix)));
+            harmony.Patch(_sendState, prefix: new HarmonyMethod(typeof(ClientLoadGate), nameof(GameStatePrefix)));
             foreach (string method in new[] { "Reset", "HandleConnectionLost", "HandleLocalLoopbackConnectionLost", "HandleDisconnectMessage" })
                 harmony.Patch(AccessTools.Method(typeof(Client), method),
                     prefix: new HarmonyMethod(typeof(ClientLoadGate), nameof(DisconnectPrefix)));
+            Type disconnection = typeof(NetworkUtils).Assembly.GetType("DisconnectionHandler", true);
+            foreach (string method in new[] { "HandleSessionConnectionLost", "HandleLocalDisconnection", "HandleKickMessage", "OnlineMultiplayerConnectionModeErrorCallback" })
+                harmony.Patch(AccessTools.Method(disconnection, method),
+                    prefix: new HarmonyMethod(typeof(ClientLoadGate), nameof(DisconnectionTracePrefix)));
         }
 
         private static bool ReceivePrefix(object __instance, IOnlineMultiplayerSessionUserId sessionUserId,
@@ -1343,6 +1367,8 @@ namespace DIYLevelFastInit
                 return false;
             }
             OnDemandResources.BeginClientPreparation(level.m_Scene);
+            _traceScene = level.m_Scene;
+            _traceClock = System.Diagnostics.Stopwatch.StartNew();
             FastInitPlugin.Log.LogInfo("DIY client level message deferred: " + level.m_Scene);
             if (!Running)
             {
@@ -1387,6 +1413,12 @@ namespace DIYLevelFastInit
                             if (MultiplayerController.IsSynchronisationActive()) controller.StopSynchronisation();
                             controller.SetLatencyMeasurePaused(true);
                         }
+                        OnDemandResources.EndClientSaveSelection();
+                        if (!IsCurrent(request)) continue;
+                        if (Queue.AnnounceStart(request, state => _sendState.Invoke(null, new object[] { state })))
+                            FastInitPlugin.Log.LogInfo("DIY client loading acknowledged before resources: " + request.Message.m_Scene
+                                + " (" + request.Message.m_StartLoadGameState + ")");
+                        if (!IsCurrent(request)) continue;
                         Box<bool> ready = new Box<bool>();
                         yield return FastInitHost.Guard(OnDemandResources.PrepareClientLevel(request.Path, request.Message.m_Scene,
                             () => IsCurrent(request), ready), "DIY client preparation [" + request.Message.m_Scene + "]");
@@ -1415,8 +1447,37 @@ namespace DIYLevelFastInit
             }
         }
 
-        private static void DisconnectPrefix(Client __instance)
+        private static bool GameStatePrefix(GameState state)
         {
+            if ((IsCurrent(Queue.Pending) && !Queue.AllowsState(state))
+                || (state == GameState.LoadedCampaignMapSave && OnDemandResources.IsClientTransition))
+            {
+                FastInitPlugin.Log.LogInfo("stale/duplicate DIY client state ignored: " + state);
+                return false;
+            }
+            if (Tracing) FastInitPlugin.Log.LogInfo("DIY client state sent: " + state + " [" + _traceScene + "]");
+            return true;
+        }
+
+        private static bool Tracing { get { return _traceClock != null && _traceClock.ElapsedMilliseconds < 120000; } }
+
+        private static void DisconnectionTracePrefix(MethodBase __originalMethod)
+        {
+            if (!Tracing) return;
+            List<string> callers = new List<string>();
+            System.Diagnostics.StackTrace stack = new System.Diagnostics.StackTrace(1, false);
+            for (int i = 0; i < stack.FrameCount && callers.Count < 10; i++)
+            {
+                MethodBase method = stack.GetFrame(i).GetMethod();
+                if (method != null) callers.Add((method.DeclaringType == null ? "" : method.DeclaringType.FullName + ".") + method.Name);
+            }
+            FastInitPlugin.Log.LogWarning("DIY client disconnect path: " + __originalMethod.Name + " [" + _traceScene
+                + ", " + _traceClock.ElapsedMilliseconds + " ms] " + string.Join(" <- ", callers.ToArray()));
+        }
+
+        private static void DisconnectPrefix(Client __instance, MethodBase __originalMethod)
+        {
+            if (Tracing) FastInitPlugin.Log.LogInfo("DIY client lifecycle: " + __originalMethod.Name + " [" + _traceScene + "]");
             if ((Queue.Pending != null && ReferenceEquals(Queue.Pending.Peer, __instance))
                 || (_active != null && ReferenceEquals(_active.Peer, __instance))) Cancel("client connection reset/lost");
         }
@@ -1468,6 +1529,10 @@ namespace DIYLevelFastInit
         private static bool _serverPreparing, _resumeServerLoad;
         private static SelectSaveDialog _visibleSaveDialog;
         private static readonly FieldInfo ClientSavePayload = AccessTools.Field(typeof(T17FrontendFlow), "m_ClientSavePayload");
+        private static readonly FieldInfo ClientCountdown = AccessTools.Field(typeof(T17FrontendFlow), "m_bShouldClientCountdown");
+        private static readonly FieldInfo OnlineSaveDialog = AccessTools.Field(typeof(T17FrontendFlow), "m_OnlineClientSaveDialog");
+        private static readonly FieldInfo LocalSaveDialog = AccessTools.Field(typeof(T17FrontendFlow), "m_saveDialog");
+        private static readonly MethodInfo ForceCloseSaveDialog = AccessTools.Method(typeof(SelectSaveDialog), "ForceClose");
         private static int _selectionFrame = -1;
         private static readonly HashSet<SaveSlotElement> SaveReadyCallbacks = new HashSet<SaveSlotElement>();
         private static bool _entryPriorityActive;
@@ -1488,16 +1553,19 @@ namespace DIYLevelFastInit
         private static bool _cleanupQueued, _cleanupRequested;
 
         internal static bool IsTransitioning { get { return _pendingScene != null; } }
+        internal static bool IsClientTransition { get { return IsTransitioning && !ConnectionStatusPublicizer.IsHost() && ConnectionStatusPublicizer.IsInSession(); } }
 
         internal static void Install(Harmony harmony)
         {
-            if (ClientSavePayload == null) throw new MissingFieldException("T17FrontendFlow.m_ClientSavePayload");
+            if (ClientSavePayload == null || ClientCountdown == null || OnlineSaveDialog == null || LocalSaveDialog == null || ForceCloseSaveDialog == null)
+                throw new MissingMemberException("DIY client save transition contract changed");
             ClientLoadGate.Install(harmony);
             Patch(harmony, typeof(DIYLevelAssetBundleManager), "LoadLevelServer", nameof(ServerLoadPrefix), null);
             Patch(harmony, typeof(DIYLevelAssetBundleManager), "LoadLevelClientPatch", nameof(LoadPrefix), null);
             Patch(harmony, typeof(DIYLevelEntryUI), "OnLevelSelected", nameof(SelectionPrefix), null);
             Patch(harmony, typeof(SelectSaveDialog), "Show", nameof(SaveDialogShowPrefix), nameof(SaveDialogShowPostfix));
             Patch(harmony, typeof(T17FrontendFlow), "ShowClientSaveDialog", nameof(ClientSaveDialogPrefix), null);
+            Patch(harmony, typeof(T17FrontendFlow), "StartClientCountdown", nameof(ClientCountdownPrefix), null);
             harmony.Patch(AccessTools.Method(typeof(SaveSlotElement), "OnSaveGameReady"),
                 prefix: new HarmonyMethod(typeof(OnDemandResources), nameof(SaveReadyPrefix)),
                 finalizer: new HarmonyMethod(typeof(OnDemandResources), nameof(SaveReadyFinalizer)));
@@ -2020,6 +2088,22 @@ namespace DIYLevelFastInit
             LevelLoadProgress = "client ...";
         }
 
+        internal static void EndClientSaveSelection()
+        {
+            T17FrontendFlow flow = T17FrontendFlow.Instance;
+            if (flow == null) return;
+            GameStateMessage.ClientSavePayload payload = ClientSavePayload.GetValue(flow) as GameStateMessage.ClientSavePayload;
+            if (payload != null && payload.DLCID == 15) ClientSavePayload.SetValue(flow, null);
+            ClientCountdown.SetValue(flow, false);
+            HashSet<SelectSaveDialog> dialogs = new HashSet<SelectSaveDialog> { _visibleSaveDialog,
+                OnlineSaveDialog.GetValue(flow) as SelectSaveDialog, LocalSaveDialog.GetValue(flow) as SelectSaveDialog };
+            foreach (SelectSaveDialog dialog in dialogs)
+                if (dialog != null && dialog.DLC == 15 && dialog.gameObject.activeInHierarchy)
+                    ForceCloseSaveDialog.Invoke(dialog, null);
+            flow.HideWaitingForPlayers();
+            FastInitPlugin.Log.LogInfo("DIY client save wait ended before resource preparation");
+        }
+
         internal static void EndClientPreparation(bool handedOff)
         {
             if (!_serverPreparing)
@@ -2175,6 +2259,8 @@ namespace DIYLevelFastInit
             FastInitPlugin.Log.LogInfo("duplicate DIY client save request ignored: already open or entering a level");
             return false;
         }
+
+        private static bool ClientCountdownPrefix() { return !IsClientTransition; }
 
         private static bool SaveReadyPrefix(SaveSlotElement __instance, out bool __state)
         {

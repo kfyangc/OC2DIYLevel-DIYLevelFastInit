@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35, single file `FastInitPlugin.cs`) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.8 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.9 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -110,6 +110,15 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
 - `PrepareResources` shares async bundle/info preparation and per-frame configuration
   factories between server and gated client entry. Keep `_directoryBuild` scoped to each
   synchronous factory. A complex individual config or scene activation may still spike.
+- On remote DIY entry, stop the frontend client save countdown, clear pending DIY save
+  payloads, force-close active DIY save dialogs through their existing cleanup path and
+  hide the save-wait overlay before preparing resources. Prevent countdown restart and
+  stale `LoadedCampaignMapSave` sends during the transition. Announce only the message's
+  start-loading state before native waits; suppress its duplicate during the scoped
+  replay. Never announce `LoadedKitchen` early: the original scene readiness path owns it.
+  State filtering for the queued request requires the current mailbox/peer/connection.
+  For two minutes after a gated entry, log client state sends and disconnect call paths
+  to distinguish load/state problems from session loss; these hooks do not alter errors.
 - Save-dialog guards cover DLC 15 only: suppress same-frame selection reentry, an already
   visible dialog, dialog reopening during entry, and repeated `OnSaveGameReady` callbacks.
   Clear duplicate frontend save payloads when suppressing their show attempt, so Update
