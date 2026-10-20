@@ -1,10 +1,31 @@
 # AGENTS.md
 
-BepInEx 5 plugin (net35, single file `FastInitPlugin.cs`) that patches
+BepInEx 5 plugin (net35) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.10 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.11 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
+
+## Source layout
+
+- `FastInitPlugin.cs`: plugin identity, shared fields and lifecycle hooks.
+- `Plugin/`: common initialization and progress rendering.
+- `Catalog/`: metadata models, disk/scene caches, discovery and incremental refresh.
+- `Frontend/`: menu rebuilding, save-dialog hooks and confirmed save-choice state.
+- `Networking/`: copied client load requests and the remote entry gate.
+- `Resources/`: shared state/hook registration, info bundles, level preparation,
+  configuration ownership, lifetime cleanup, Qichi and info dependency adapters.
+- `Previews/`: preview requests, thumbnail warmup and the persistent thumbnail cache.
+- `Diagnostics/`: material auditing.
+- `Infrastructure/`: coroutine host, async request helpers and result boxes.
+- `BundleCodecs/`: the attributed LZMA SDK decoder subset.
+
+`FastInitPlugin` and `OnDemandResources` use partial files to retain their existing
+reflection and Harmony contracts. Keep their fields/initializers together, in their
+original order, in `FastInitPlugin.cs` and `Resources/OnDemandResources.cs` respectively.
+Do not move initializers between partial files or rely on source-file compilation order.
+The 1.6.11 split preserves all 23 top-level types and 410 original members, apart from
+the version constant and partial declarations. It adds no loading or save behaviour.
 
 ## Build / deploy / verify
 
@@ -262,7 +283,7 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
 ## Code style
 
 - Comments in English, minimal: one class-level `<summary>` plus single-line `//` notes
-  only where the code can't speak (see current file).
+  only where the code can't speak. Keep the existing style across the partial files.
 - Chinese only in functional UI/localization strings. If any non-ASCII source is added,
   keep the UTF-8 BOM (csc otherwise reads the file as the system codepage).
 

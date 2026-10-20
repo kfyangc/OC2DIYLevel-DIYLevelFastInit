@@ -4,7 +4,9 @@ Startup and memory optimization for the [OC2DIYLevel](https://github.com/gua248/
 
 [中文说明](README_CN.md)
 
-## Version 1.6.10
+## Version 1.6.11
+
+This revision splits the implementation into focused source files while retaining the 1.6.10 runtime behaviour. `FastInitPlugin.cs` contains the plugin identity and lifecycle; the source layout below identifies the owners of each feature.
 
 Asynchronous loading removed the main-menu freeze, but keeping every info bundle and prebuilding four configurations for every level still consumed the limited address space of the 32-bit game.
 
@@ -44,6 +46,21 @@ dotnet build -c Release -p:GameDir="D:\Games\Steam Games\steamapps\common\Overco
 
 Output: `bin/Release/DIYLevelFastInit.dll`. Targets .NET Framework 3.5 and C# 7.3. Keep the project's `NuGet.config`.
 
+## Source layout
+
+| Location | Responsibility |
+| --- | --- |
+| `FastInitPlugin.cs`, `Plugin/` | Plugin lifecycle, common initialization and progress display |
+| `Catalog/` | Lightweight metadata, directory/cache handling, discovery and refresh |
+| `Frontend/` | Menus, save selection and confirmed-choice reuse |
+| `Networking/` | Copied client messages, connection validation and deferred entry |
+| `Resources/` | Info bundles, configurations, entry, lifetime cleanup and dependency adapters |
+| `Previews/` | Preview requests, thumbnail warmup and disk cache |
+| `Diagnostics/`, `Infrastructure/` | Material auditing, coroutine host and async helpers |
+| `BundleCodecs/` | LZMA SDK decoder subset and its supporting types |
+
+`FastInitPlugin` and `OnDemandResources` retain their type names through partial declarations. Shared fields and initializers remain in their core files in the original order. SDK default source inclusion compiles all files into the same plugin DLL.
+
 ## Verification
 
 Relevant lines in `BepInEx/LogOutput.log`:
@@ -65,7 +82,7 @@ Relevant lines in `BepInEx/LogOutput.log`:
 
 Exercise browsing, sorting, previews, save selection/read/write, entry, repeated restarts, transitions between sets, return to the menu, hot reload, and host/client multiplayer. Record process private memory across cycles; transitions may have temporary peaks. Compilation and hook signature checks do not replace gameplay testing.
 
-Version 1.6.10 has offline checks for deferred-message ownership, one replay, an early start acknowledgement without a duplicate on replay, rejection of stale save states, preservation of the original kitchen-ready signal, cancellation, failed sends and reconnection. Confirmed-choice reuse, isolation between frontends/resets and yielding until save cleanup succeeds are also checked. All 31 patched signatures and the frontend field/method contracts resolve against the installed assemblies. DMM multiplayer entry was reported working with 1.6.9; native UI changes and multiplayer entry still require regression on 1.6.10. Qichi client disconnection remains under investigation and requires the affected client's log.
+Version 1.6.11 retains the offline checks for deferred-message ownership, one replay, an early start acknowledgement without a duplicate on replay, rejection of stale save states, preservation of the original kitchen-ready signal, cancellation, failed sends and reconnection. Confirmed-choice reuse, isolation between frontends/resets and yielding until save cleanup succeeds are also checked. All 31 patched signatures and the frontend field/method contracts resolve against the installed assemblies. The source split additionally preserves the tokenized declarations/bodies of all 23 top-level types and 410 members, including attributes, base types and field order, with only partial declarations and the version constant changed. DMM multiplayer entry was reported working with 1.6.9; the later native UI changes and multiplayer entry still require regression. Qichi client disconnection remains under investigation and requires the affected client's log.
 
 ## Disclaimer
 
