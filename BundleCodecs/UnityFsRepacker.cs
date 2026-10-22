@@ -88,7 +88,7 @@ namespace DIYLevelFastInit.BundleCodecs
                     List<Block> blocks;
                     using (SHA256 hash = SHA256.Create())
                     {
-                        ChunkOutput sink = new ChunkOutput(output, layout.Plain, (ushort)(layout.BlockFlags & ~63), hash, cancelled, checkpoint);
+                        ChunkOutput sink = new ChunkOutput(output, layout.Plain, hash, cancelled, checkpoint);
                         Compression.LZMA.Decoder decoder = new Compression.LZMA.Decoder();
                         decoder.SetDecoderProperties(layout.Properties);
                         using (LimitedInput limited = new LimitedInput(input, layout.Packed - 5, cancelled, checkpoint))
@@ -354,7 +354,6 @@ namespace DIYLevelFastInit.BundleCodecs
         {
             private readonly Stream _output;
             private readonly long _limit;
-            private readonly ushort _flags;
             private readonly SHA256 _hash;
             private readonly Func<bool> _cancelled;
             private readonly Action _checkpoint;
@@ -363,8 +362,8 @@ namespace DIYLevelFastInit.BundleCodecs
             private long _written;
             private int _filled;
             internal readonly List<Block> Blocks = new List<Block>();
-            internal ChunkOutput(Stream output, long limit, ushort flags, SHA256 hash, Func<bool> cancelled, Action checkpoint)
-            { _output = output; _limit = limit; _flags = flags; _hash = hash; _cancelled = cancelled; _checkpoint = checkpoint; }
+            internal ChunkOutput(Stream output, long limit, SHA256 hash, Func<bool> cancelled, Action checkpoint)
+            { _output = output; _limit = limit; _hash = hash; _cancelled = cancelled; _checkpoint = checkpoint; }
             public override bool CanWrite { get { return true; } }
             public override void Write(byte[] buffer, int offset, int count)
             {
@@ -392,7 +391,7 @@ namespace DIYLevelFastInit.BundleCodecs
                 int length = compressed ? packed : _filled;
                 if (_output.Position > MaxBytes - length) throw new IOException("Converted bundle exceeds the output limit");
                 _output.Write(compressed ? _packed : _plain, 0, length);
-                Blocks.Add(new Block { Plain = (uint)_filled, Packed = (uint)length, Flags = (ushort)(_flags | (compressed ? 2 : 0)) });
+                Blocks.Add(new Block { Plain = (uint)_filled, Packed = (uint)length, Flags = (ushort)(compressed ? 2 : 0) });
                 _filled = 0;
                 Check(_cancelled, _checkpoint);
             }

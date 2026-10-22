@@ -17,7 +17,8 @@ namespace DIYLevelFastInit
                 string root = Path.Combine(Path.Combine(Paths.CachePath, "DIYLevelFastInit"), "bundles");
                 BundleFileCache.Configure(root,
                     delegate(string message) { Log.LogInfo(message); });
-                Log.LogInfo("LZ4 bundle cache enabled: " + root + " (info_dmm; waiting for idle frontend)");
+                Log.LogInfo("LZ4 bundle cache enabled: " + root + " (format " + BundleFileCache.FormatVersion
+                    + "; info_dmm; waiting for idle frontend)");
             }
             catch (Exception e) { Log.LogWarning("bundle cache unavailable; original bundles retained: " + e.Message); }
         }

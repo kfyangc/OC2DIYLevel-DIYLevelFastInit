@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.15 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.16 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -296,6 +296,14 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   their last active, pending, preview or warmup owner has finished.
 
 ## Disposable bundle cache
+
+- Generated independent LZ4/raw blocks must use flags `0x02`/`0x00`. Never copy the
+  source LZMA `Streamed=0x40` bit: this game's native LZ4 stream callbacks return false,
+  even when a generic LZ4 parser accepts the compressed bytes. Whole-bundle Unity
+  acceptance is distinct from isolated decoder and managed Mono validation.
+- `BundleFileCache.FormatVersion` is part of the cache key. Bump it for incompatible
+  generated layouts so earlier bundles and persistent `.bad` markers cannot mask a fix.
+  Keep metadata schema changes separate from converter-format changes.
 
 - `BundleFileCache` is pure managed code. Its single low-priority worker must not call
   Unity/BepInEx APIs; `Tick` gates idle work and forwards queued diagnostics on the main thread.

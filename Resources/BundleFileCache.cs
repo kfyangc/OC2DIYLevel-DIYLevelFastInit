@@ -86,6 +86,7 @@ namespace DIYLevelFastInit
 
         private const int Magic = 0x31434642;
         private const int Schema = 1;
+        internal const int FormatVersion = 2;
         private const int BadMagic = 0x31424342;
         private const long MaxBytes = 512L * 1024 * 1024;
         private static readonly object Configuration = new object();
@@ -233,7 +234,8 @@ namespace DIYLevelFastInit
             string path = Normalize(source);
             FileInfo file = new FileInfo(path);
             if (!file.Exists) throw new IOException("Source bundle does not exist");
-            string identity = path.ToUpperInvariant() + "\n" + file.Length + "\n" + file.LastWriteTimeUtc.Ticks;
+            string identity = "UnityFS-LZ4/" + FormatVersion.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                + "\n" + path.ToUpperInvariant() + "\n" + file.Length + "\n" + file.LastWriteTimeUtc.Ticks;
             string key;
             using (SHA256 hash = SHA256.Create()) key = Hex(hash.ComputeHash(Encoding.UTF8.GetBytes(identity)));
             return new Entry { Source = path, Key = key, SourceLength = file.Length, SourceTicks = file.LastWriteTimeUtc.Ticks,
@@ -311,7 +313,13 @@ namespace DIYLevelFastInit
             {
                 if (fileLock == null) return;
                 if (!MatchesSource(entry)) return;
-                if (IsBad(entry)) { lock (state.Sync) entry.Rejected = true; return; }
+                if (IsBad(entry))
+                {
+                    lock (state.Sync) entry.Rejected = true;
+                    Log(state, "bundle file cache disabled after previous Unity load failure: " + entry.Source
+                        + " (format " + FormatVersion + "; using source)");
+                    return;
+                }
                 Metadata metadata = ReadMetadata(entry);
                 if (metadata != null && Validate(state, entry, metadata))
                 {

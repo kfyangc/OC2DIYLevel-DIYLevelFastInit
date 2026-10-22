@@ -4,6 +4,14 @@ Startup and memory optimization for the [OC2DIYLevel](https://github.com/gua248/
 
 [中文说明](README_CN.md)
 
+## Version 1.6.16
+
+Fixes generated LZ4 caches being rejected and subsequent entries using the original file. Versions 1.6.13–1.6.15 inherited the source LZMA block's `Streamed=0x40` flag for independent LZ4/raw blocks. The game's native reader then invokes its unsupported streamed LZ4 callbacks, reports `Failed to decompress data for the AssetBundle`, and persists a rejection marker. New blocks contain only compression flags `0x02`/`0x00`; compressed payloads and resource bytes are preserved.
+
+Cache keys now include format version 2, isolating old bundles and rejection markers automatically. After upgrading, allow the frontend to idle until `bundle file cache built`, then confirm entry logs report `info bundle source: info_dmm (LZ4 cache)`. Startup identifies `format 2`, and persistent rejection now logs its reason explicitly.
+
+The observed 1.6.15 entry used the original file: 7,597 ms bundle loading, 78 ms selected info, 7,926 ms preparation, then 3,566 ms from scene handoff to arrival. That run did not exercise LZ4 and cannot measure its benefit. Evidence is under `../.verification/perf-1.6.15/`.
+
 ## Version 1.6.15
 
 Fixes first-time LZ4 cache creation on the game's bundled Mono runtime. Missing files/paths can throw `IsolatedStorageException`, which is not an `IOException`; checking an absent `.bad` or `.meta` previously aborted the job and left only `.lock`. The source reader also used a `FileOptions` constructor overload missing from this runtime; it now uses the supported five-argument overload. Missing files now produce a normal cache miss, and compatibility handling also covers files disappearing after the existence check. Worker errors retain their type/stack, and startup logs show the enabled cache directory.
@@ -86,6 +94,8 @@ Output: `bin/Release/DIYLevelFastInit.dll`. Targets .NET Framework 3.5 and C# 7.
 `FastInitPlugin` and `OnDemandResources` retain their type names through partial declarations. Shared fields and initializers remain in their core files in the original order. SDK default source inclusion compiles all files into the same plugin DLL.
 
 ## Verification
+
+Version 1.6.16 passes the Release build, 157 cache-manager assertions, 39 old-Mono compatibility assertions and 25 format migration/rejection assertions. Thirteen byte-level checks against this machine's UnityPlayer confirm streamed routing and LZ4 stream callbacks that unconditionally fail. The actual DMM cache differs from the old output at exactly 1,231 flag bytes; every other file byte and the decompressed source hash are unchanged. Actual game Mono cold construction and reinitialized hash-validation/reuse pass, together with codec boundary/layout/corruption/cancellation checks. Results are under `../.verification/cache-1.6.16/`. Full corrected AssetBundle loading and speed gains remain unmeasured in the game; confirm an actual `LZ4 cache` entry and its phase timings.
 
 Version 1.6.15 passes the Release build, 39 old-Mono file-exception compatibility assertions, the existing 156 cache-manager assertions and installed-runtime compatibility checks including 31 Harmony signatures. A separate x86 host loads the actual game `mono.dll`/corlib (runtime 2.0.50727.1433): the old manager reproduces the missing `.bad` failure; fixed production cache/codec sources build a fresh 110,259,016-byte DMM cache (26,007 ms for that isolated conversion), then validate and reuse it after manager reinitialization without reconversion. Records are under `../.verification/cache-1.6.15/`. This exercises actual Mono file/conversion behavior without launching the game or executing Unity native AssetBundle loading; conversion duration is not level-entry latency.
 
