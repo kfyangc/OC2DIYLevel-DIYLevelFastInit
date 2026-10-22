@@ -20,7 +20,7 @@ namespace DIYLevelFastInit
     {
         public const string PluginGuid = "oc2.diylevel.fastinit";
         public const string PluginName = "DIYLevel FastInit";
-        public const string PluginVersion = "1.6.11";
+        public const string PluginVersion = "1.6.12";
 
         internal static ManualLogSource Log;
 
@@ -97,6 +97,7 @@ namespace DIYLevelFastInit
         private void OnDestroy()
         {
             ClientLoadGate.Cancel("plugin shutdown");
+            OnDemandResources.CancelServerPreparation("plugin shutdown");
             OnDemandResources.RestoreEntryPriority("plugin shutdown");
         }
     }

@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.11 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.12 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -128,6 +128,18 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   independently of server preparation. Restore a client latency pause on failed/cancelled
   preparation only while its connection still matches. Leave unrelated mailbox traffic,
   vanilla levels and host loopback on their original paths.
+- Client message preparation and handed-off transition ownership are separate. Cancel
+  immediately revokes state filtering, while native requests retain their resource pins
+  until completion. Filtering after handoff belongs to the original mailbox/peer/connection
+  and ends on target scene arrival; stale `_pendingScene` is not a connection identity.
+- Observe official save requests before Team17 opens their dialogs: clear obsolete DIY
+  confirmation/UI ownership and cancel old client/server entry permissions while keeping
+  native drain pins. Remote save guards use current transition identity, not resource
+  pending state, so a cancelled request cannot block a fresh save handshake.
+- Server preparation has a generation and a captured network context. Recheck them after
+  resource waits, between config factories and before handing off. Frontend arrival,
+  connection reset/loss and shutdown invalidate the generation without releasing native
+  request pins early. A cancelled online request must not resume as an offline load.
 - `PrepareResources` shares async bundle/info preparation and per-frame configuration
   factories between server and gated client entry. Keep `_directoryBuild` scoped to each
   synchronous factory. A complex individual config or scene activation may still spike.

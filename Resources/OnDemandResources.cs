@@ -74,6 +74,7 @@ namespace DIYLevelFastInit
         private static string _pendingScene, _previewPath, _buildingScene;
         private static bool _directoryBuild;
         private static bool _cleanupQueued, _cleanupRequested;
+        private static long _serverPreparationGeneration;
 
         internal static bool IsTransitioning { get { return _pendingScene != null; } }
         internal static bool IsClientTransition { get { return IsTransitioning && !ConnectionStatusPublicizer.IsHost() && ConnectionStatusPublicizer.IsInSession(); } }

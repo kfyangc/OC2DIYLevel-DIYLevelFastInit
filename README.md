@@ -4,9 +4,15 @@ Startup and memory optimization for the [OC2DIYLevel](https://github.com/gua248/
 
 [中文说明](README_CN.md)
 
-## Version 1.6.11
+## Version 1.6.12
 
-This revision splits the implementation into focused source files while retaining the 1.6.10 runtime behaviour. `FastInitPlugin.cs` contains the plugin identity and lifecycle; the source layout below identifies the owners of each feature.
+This revision fixes load-request ownership across cancellation and reconnection, following Team17's per-connection loading and readiness flow:
+
+- A cancelled client preparation immediately stops filtering save-ready messages, even while its native resource request is still draining. Successful handoff retains the filter only for that exact mailbox, peer and connection until the target scene arrives.
+- Server preparation checks its request generation and network context after waits and before handoff. Returning to the frontend, resetting the connection or changing roles invalidates the old request; it cannot resume later as an offline load.
+- Switching from a confirmed DIY save choice to an official DLC save request clears the old confirmation and cancels obsolete entry permissions before the host waits for save-ready. The official countdown and a later DIY selection can proceed while cancelled resource work drains.
+
+The source layout introduced in 1.6.11 is retained. Resource requests still drain before their pins are released, and the original kitchen-ready handshake remains responsible for starting play.
 
 Asynchronous loading removed the main-menu freeze, but keeping every info bundle and prebuilding four configurations for every level still consumed the limited address space of the 32-bit game.
 
@@ -62,6 +68,10 @@ Output: `bin/Release/DIYLevelFastInit.dll`. Targets .NET Framework 3.5 and C# 7.
 `FastInitPlugin` and `OnDemandResources` retain their type names through partial declarations. Shared fields and initializers remain in their core files in the original order. SDK default source inclusion compiles all files into the same plugin DLL.
 
 ## Verification
+
+Version 1.6.12 passed a Release build, 59 network transition assertions against the production gate/queue, 13 server preparation scenarios against the production iterators, and 95 frontend assertions using installed managed game types and the production request policies. The same network harness reproduces the cancelled-request save-ready failure with 1.6.11 sources; the server baseline fails all 11 cancellation scenarios while passing its two normal-entry scenarios. Existing cache, thumbnail, copied-message, save-selection and 31 Harmony wrapper checks also pass; the handoff check now keeps the save-state guard until target scene arrival.
+
+Local reproduction sources and results are in `../.verification/network-1.6.12/`, `server-1.6.12/`, `frontend-1.6.12/`, and `fixes-1.6.12/`. External/native boundaries are stubbed in the network/server checks. Frontend checks exercise managed request policies and prefix branches, not Unity native dialogs. These results do not establish actual Steam connectivity, bundle lifetime correctness in Unity, or resolution of every Qichi client disconnection. The built DLL has not been deployed by these checks.
 
 Relevant lines in `BepInEx/LogOutput.log`:
 

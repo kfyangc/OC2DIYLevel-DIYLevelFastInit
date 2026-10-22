@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections;
 using System.Collections.Generic;
+using OC2DIYLevel.Extension;
 using Team17.Online;
 using Team17.Online.Multiplayer.Messaging;
 using UnityEngine;
@@ -9,6 +10,16 @@ namespace DIYLevelFastInit
 {
     internal static partial class OnDemandResources
     {
+
+        private static bool IsSaveEntryActive
+        {
+            get
+            {
+                bool remoteClient = ConnectionStatusPublicizer.IsInSession() && !ConnectionStatusPublicizer.IsHost();
+                return SaveSelectionState.IsEntryActive(remoteClient, IsTransitioning,
+                    remoteClient && ClientLoadGate.HasCurrentTransition);
+            }
+        }
 
         internal static IEnumerator FinishSaveSelection(Func<bool> current, string context)
         {
@@ -34,7 +45,7 @@ namespace DIYLevelFastInit
 
         private static bool SelectionPrefix()
         {
-            if (FastInitPlugin.Syncing || IsTransitioning || _catalogBundles != null) return false;
+            if (FastInitPlugin.Syncing || IsSaveEntryActive || _catalogBundles != null) return false;
             if (_selectionFrame == Time.frameCount || (_visibleSaveDialog != null && _visibleSaveDialog.gameObject.activeInHierarchy))
             {
                 FastInitPlugin.Log.LogInfo("duplicate DIY level selection ignored: save dialog already opening/open");
@@ -47,8 +58,12 @@ namespace DIYLevelFastInit
 
         private static bool SaveDialogShowPrefix(SelectSaveDialog __instance, ref bool __result)
         {
+            T17FrontendFlow flow = T17FrontendFlow.Instance;
+            GameStateMessage.ClientSavePayload payload = ReferenceEquals(flow, null) ? null
+                : ClientSavePayload.GetValue(flow) as GameStateMessage.ClientSavePayload;
+            if (!ObserveSaveDialogRequest(flow, payload, __instance.DLC)) return true;
             if (__instance.DLC != 15) return true;
-            if (!IsTransitioning && !SaveSelection.IsConfirmed(T17FrontendFlow.Instance) && !__instance.gameObject.activeInHierarchy) return true;
+            if (!IsSaveEntryActive && !SaveSelection.IsConfirmed(T17FrontendFlow.Instance) && !__instance.gameObject.activeInHierarchy) return true;
             __result = false;
             FastInitPlugin.Log.LogInfo("duplicate DIY save dialog ignored: already open or entering a level");
             return false;
@@ -64,13 +79,13 @@ namespace DIYLevelFastInit
         private static void SaveDialogHidePrefix(SelectSaveDialog __instance, ref bool restoreInvokerState, out bool __state)
         {
             __state = __instance.DLC == 15 && __instance.gameObject.activeSelf;
-            if (__instance.DLC == 15 && IsTransitioning) restoreInvokerState = false;
+            if (__instance.DLC == 15 && IsSaveEntryActive) restoreInvokerState = false;
         }
 
         private static void SaveDialogHidePostfix(SelectSaveDialog __instance, bool __state, bool __result)
         {
             if (__state && __result) FastInitPlugin.Log.LogInfo("DIY save dialog closed: id=" + __instance.GetInstanceID()
-                + ", entering=" + IsTransitioning + ", frame=" + Time.frameCount);
+                + ", entering=" + IsSaveEntryActive + ", frame=" + Time.frameCount);
         }
 
         private static void ConfirmSaveSelection()
@@ -104,31 +119,57 @@ namespace DIYLevelFastInit
         private static bool ClientSaveDialogPrefix(T17FrontendFlow __instance)
         {
             GameStateMessage.ClientSavePayload payload = ClientSavePayload.GetValue(__instance) as GameStateMessage.ClientSavePayload;
-            if (payload == null || payload.DLCID != 15) return true;
+            if (!ObserveClientSaveRequest(__instance, payload)) return true;
             if (SaveSelection.IsConfirmed(__instance))
             {
                 ClientSavePayload.SetValue(__instance, null);
                 ClientCountdown.SetValue(__instance, false);
-                SaveSelection.Reuse(__instance, IsTransitioning, ClientLoadGate.RepeatSaveReady);
+                SaveSelection.Reuse(__instance, IsSaveEntryActive, ClientLoadGate.RepeatSaveReady);
                 FastInitPlugin.Log.LogInfo("duplicate DIY client save request reused the confirmed choice");
                 return false;
             }
-            if (!IsTransitioning && (_visibleSaveDialog == null || !_visibleSaveDialog.gameObject.activeInHierarchy)) return true;
+            if (!IsSaveEntryActive && (_visibleSaveDialog == null || !_visibleSaveDialog.gameObject.activeInHierarchy)) return true;
             ClientSavePayload.SetValue(__instance, null);
             FastInitPlugin.Log.LogInfo("duplicate DIY client save request ignored: already open or entering a level");
             return false;
         }
 
-        private static bool ClientCountdownPrefix()
+        private static bool ClientCountdownPrefix(T17FrontendFlow __instance)
         {
-            return !IsClientTransition && !SaveSelection.IsConfirmed(T17FrontendFlow.Instance);
+            GameStateMessage.ClientSavePayload payload = ClientSavePayload.GetValue(__instance) as GameStateMessage.ClientSavePayload;
+            if (payload != null) ObserveClientSaveRequest(__instance, payload);
+            if (!SaveSelection.IsDiyRequest(__instance)) return true;
+            if (SaveSelection.IsConfirmed(__instance)) return false;
+            return !ClientLoadGate.HasCurrentTransition;
+        }
+
+        private static bool ObserveClientSaveRequest(T17FrontendFlow flow, GameStateMessage.ClientSavePayload payload)
+        {
+            if (payload == null) return false;
+            return ObserveSaveRequest(flow, payload.DLCID);
+        }
+
+        private static bool ObserveSaveDialogRequest(T17FrontendFlow flow, GameStateMessage.ClientSavePayload payload, int dialogDlc)
+        {
+            int dlc = payload != null && payload.DLCID != 15 ? payload.DLCID : dialogDlc;
+            return ObserveSaveRequest(flow, dlc);
+        }
+
+        private static bool ObserveSaveRequest(T17FrontendFlow flow, int dlc)
+        {
+            SaveSelection.ObserveRequest(flow, dlc);
+            if (dlc == 15) return true;
+            _visibleSaveDialog = null;
+            ClientLoadGate.Cancel("official save selection requested");
+            CancelServerPreparation("official save selection requested");
+            return false;
         }
 
         private static bool SaveReadyPrefix(SaveSlotElement __instance, out bool __state)
         {
             __state = false;
             if (__instance.DLC != 15) return true;
-            if (__instance.SaveGameReady || IsTransitioning || SaveSelection.IsConfirmed(T17FrontendFlow.Instance)
+            if (__instance.SaveGameReady || SaveSelection.IsConfirmed(T17FrontendFlow.Instance) || IsSaveEntryActive
                 || SaveReadyCallbacks.Count != 0 || !SaveReadyCallbacks.Add(__instance))
             {
                 FastInitPlugin.Log.LogInfo("duplicate DIY save confirmation ignored");

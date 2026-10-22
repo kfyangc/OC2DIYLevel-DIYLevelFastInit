@@ -18,7 +18,7 @@ namespace DIYLevelFastInit
             internal bool StartAnnounced;
         }
 
-        internal Request Pending, Replaying;
+        internal Request Pending, Replaying, Transition;
 
         internal bool Enqueue(object mailbox, object peer, object connection, IOnlineMultiplayerSessionUserId sender,
             LevelLoadByNameMessage message, string path, uint sequence, bool reliable)
@@ -32,11 +32,31 @@ namespace DIYLevelFastInit
             copy.Initialise(message.m_StartLoadGameState, message.m_HideLoadingScreenGameState, message.m_Scene, message.UseLoadingScreen);
             Pending = new Request { Mailbox = mailbox, Peer = peer, Connection = connection, Sender = sender,
                 Message = copy, Path = path, Sequence = sequence, Reliable = reliable };
+            Transition = Pending;
             return true;
         }
 
         internal bool IsCurrent(Request request) { return request != null && ReferenceEquals(Pending, request); }
-        internal void Cancel() { Pending = null; }
+        internal static bool HasIdentity(Request request, object mailbox, object peer, object connection, bool remoteClient)
+        {
+            return remoteClient && request != null && mailbox != null && peer != null && connection != null
+                && ReferenceEquals(request.Mailbox, mailbox) && ReferenceEquals(request.Peer, peer)
+                && ReferenceEquals(request.Connection, connection);
+        }
+
+        internal void Cancel() { Pending = null; Transition = null; }
+
+        internal void CancelRequest(Request request)
+        {
+            if (ReferenceEquals(Pending, request)) Pending = null;
+            if (ReferenceEquals(Transition, request)) Transition = null;
+        }
+
+        internal void SceneLoaded(string scene)
+        {
+            if (Transition != null && (!IsCurrent(Transition) || ReferenceEquals(Replaying, Transition))
+                && string.Equals(Transition.Message.m_Scene, scene, StringComparison.OrdinalIgnoreCase)) Transition = null;
+        }
 
         internal bool AnnounceStart(Request request, Action<GameState> send)
         {
@@ -48,7 +68,7 @@ namespace DIYLevelFastInit
 
         internal bool AllowsState(GameState state)
         {
-            if (Pending != null && state == GameState.LoadedCampaignMapSave) return false;
+            if (Transition != null && state == GameState.LoadedCampaignMapSave) return false;
             return Replaying == null || !Replaying.StartAnnounced || state != Replaying.Message.m_StartLoadGameState;
         }
 
@@ -56,11 +76,13 @@ namespace DIYLevelFastInit
         {
             if (!IsCurrent(request) || Replaying != null) return false;
             Replaying = request;
-            try { dispatch(request); return true; }
+            bool delivered = false;
+            try { dispatch(request); delivered = true; return true; }
             finally
             {
                 Replaying = null;
                 if (IsCurrent(request)) Pending = null;
+                if (!delivered && ReferenceEquals(Transition, request)) Transition = null;
             }
         }
     }

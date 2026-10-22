@@ -43,6 +43,8 @@ namespace DIYLevelFastInit
         private static void SceneLoaded(Scene scene, LoadSceneMode mode)
         {
             bool frontend = scene.name == "StartScreen" || scene.name == "Lobbies";
+            ClientLoadGate.SceneLoaded(scene.name);
+            if (frontend) CancelServerPreparation("frontend scene loaded");
             if (_entryPriorityActive && (frontend || string.Equals(scene.name, _entryPriorityScene, StringComparison.OrdinalIgnoreCase)))
                 RestoreEntryPriority("scene ready: " + scene.name);
             if (frontend || string.Equals(scene.name, _pendingScene, StringComparison.OrdinalIgnoreCase))

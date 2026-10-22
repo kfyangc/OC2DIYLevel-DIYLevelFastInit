@@ -25,6 +25,7 @@ namespace DIYLevelFastInit
         private static string _traceScene;
         private static System.Diagnostics.Stopwatch _traceClock;
         internal static bool Running;
+        internal static bool HasCurrentTransition { get { return IsIdentityCurrent(Queue.Transition); } }
 
         internal static void Install(Harmony harmony)
         {
@@ -84,11 +85,17 @@ namespace DIYLevelFastInit
 
         private static bool IsCurrent(ClientLoadQueue.Request request)
         {
-            return Queue.IsCurrent(request) && FastInitPlugin.Instance != null
-                && !ConnectionStatusPublicizer.IsHost() && ConnectionStatusPublicizer.IsInSession()
-                && ReferenceEquals(_clientMailbox.GetValue(null), request.Mailbox)
-                && ReferenceEquals(_mailboxPeer.GetValue(request.Mailbox), request.Peer)
-                && ReferenceEquals(ServerConnection.GetValue(request.Peer), request.Connection);
+            return Queue.IsCurrent(request) && IsIdentityCurrent(request);
+        }
+
+        private static bool IsIdentityCurrent(ClientLoadQueue.Request request)
+        {
+            if (request == null || FastInitPlugin.Instance == null) return false;
+            object mailbox = _clientMailbox.GetValue(null);
+            Client peer = mailbox == null ? null : _mailboxPeer.GetValue(mailbox) as Client;
+            object connection = peer == null ? null : ServerConnection.GetValue(peer);
+            return ClientLoadQueue.HasIdentity(request, mailbox, peer, connection,
+                !ConnectionStatusPublicizer.IsHost() && ConnectionStatusPublicizer.IsInSession());
         }
 
         private static IEnumerator Prepare()
@@ -104,7 +111,7 @@ namespace DIYLevelFastInit
                     yield return null;
                     if (!IsCurrent(request))
                     {
-                        if (Queue.IsCurrent(request)) Queue.Cancel();
+                        Queue.CancelRequest(request);
                         continue;
                     }
                     NetworkConnection connection = (NetworkConnection)request.Connection;
@@ -134,7 +141,7 @@ namespace DIYLevelFastInit
                     }
                     finally
                     {
-                        if (Queue.IsCurrent(request)) Queue.Cancel();
+                        if (!handedOff) Queue.CancelRequest(request);
                         if (!handedOff && !paused && controller != null
                             && ReferenceEquals(ServerConnection.GetValue(request.Peer), request.Connection))
                             controller.SetLatencyMeasurePaused(false);
@@ -143,7 +150,7 @@ namespace DIYLevelFastInit
             }
             finally
             {
-                Queue.Cancel();
+                if (!handedOff) Queue.CancelRequest(_active);
                 _active = null;
                 Running = false;
                 OnDemandResources.EndClientPreparation(handedOff);
@@ -152,8 +159,7 @@ namespace DIYLevelFastInit
 
         private static bool GameStatePrefix(GameState state)
         {
-            if ((IsCurrent(Queue.Pending) && !Queue.AllowsState(state))
-                || (state == GameState.LoadedCampaignMapSave && OnDemandResources.IsClientTransition))
+            if ((HasCurrentTransition || IsIdentityCurrent(Queue.Replaying)) && !Queue.AllowsState(state))
             {
                 FastInitPlugin.Log.LogInfo("stale/duplicate DIY client state ignored: " + state);
                 return false;
@@ -189,15 +195,22 @@ namespace DIYLevelFastInit
 
         private static void DisconnectPrefix(Client __instance, MethodBase __originalMethod)
         {
-            OnDemandResources.ResetSaveSelection();
+            object mailbox = _clientMailbox.GetValue(null);
+            if (mailbox != null && ReferenceEquals(_mailboxPeer.GetValue(mailbox), __instance))
+            {
+                OnDemandResources.CancelServerPreparation("client " + __originalMethod.Name);
+                OnDemandResources.ResetSaveSelection();
+            }
             if (Tracing) FastInitPlugin.Log.LogInfo("DIY client lifecycle: " + __originalMethod.Name + " [" + _traceScene + "]");
-            if ((Queue.Pending != null && ReferenceEquals(Queue.Pending.Peer, __instance))
+            if ((Queue.Transition != null && ReferenceEquals(Queue.Transition.Peer, __instance))
                 || (_active != null && ReferenceEquals(_active.Peer, __instance))) Cancel("client connection reset/lost");
         }
 
+        internal static void SceneLoaded(string scene) { Queue.SceneLoaded(scene); }
+
         internal static void Cancel(string reason)
         {
-            if (Queue.Pending == null) return;
+            if (Queue.Pending == null && Queue.Transition == null) return;
             FastInitPlugin.Log.LogInfo("DIY client level preparation cancelled: " + reason);
             Queue.Cancel();
         }
