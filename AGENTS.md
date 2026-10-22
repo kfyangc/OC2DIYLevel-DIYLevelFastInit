@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.14 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.15 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -333,6 +333,15 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   keep the UTF-8 BOM (csc otherwise reads the file as the system codepage).
 
 ## Build gotchas
+
+- This installed Mono's `FileStream` and `MonoIO` can throw
+  `System.IO.IsolatedStorage.IsolatedStorageException` for missing files/paths. It derives
+  directly from `Exception`, not `IOException`. Cache miss/race handling must cover it;
+  do not rely only on desktop CLR file exceptions. Verify empty-cache creation against
+  the actual game runtime, and keep simulator results distinct from native execution.
+  The bundled corlib also lacks the public six-argument `FileStream(..., FileOptions)`
+  overload. Use the supported five-argument buffered constructor; compile managed-only
+  cache/codec probes against the actual game corlib as an additional API check.
 
 - The `UnityEngine.dll` facade alone is not enough: module references
   (CoreModule, AssetBundleModule, ImageConversionModule, IMGUIModule, TextRenderingModule,

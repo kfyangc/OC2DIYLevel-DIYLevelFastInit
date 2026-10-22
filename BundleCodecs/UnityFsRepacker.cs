@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Security.Cryptography;
@@ -49,6 +49,7 @@ namespace DIYLevelFastInit.BundleCodecs
                 using (FileStream stream = OpenSource(path)) ReadLayout(stream);
                 return true;
             }
+            catch (System.IO.IsolatedStorage.IsolatedStorageException) { return false; }
             catch (IOException) { return false; }
             catch (UnauthorizedAccessException) { return false; }
             catch (ArgumentException) { return false; }
@@ -117,7 +118,7 @@ namespace DIYLevelFastInit.BundleCodecs
 
         private static FileStream OpenSource(string path)
         {
-            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, CheckSize, FileOptions.SequentialScan);
+            return new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, CheckSize);
         }
 
         private static Layout ReadLayout(FileStream stream)

@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.IsolatedStorage;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -139,7 +140,7 @@ namespace DIYLevelFastInit
                     try
                     {
                         FileInfo file = new FileInfo(entry.Bundle);
-                        if (file.Length == entry.OutputLength && file.LastWriteTimeUtc.Ticks == entry.OutputTicks)
+                        if (file.Exists && file.Length == entry.OutputLength && file.LastWriteTimeUtc.Ticks == entry.OutputTicks)
                         {
                             FileStream pin = new FileStream(entry.Bundle, FileMode.Open, FileAccess.Read, FileShare.Read);
                             entry.Pins++;
@@ -149,6 +150,7 @@ namespace DIYLevelFastInit
                             return new Lease(state, entry, pin);
                         }
                     }
+                    catch (IsolatedStorageException) { }
                     catch (IOException) { }
                     catch (UnauthorizedAccessException) { }
                     entry.Ready = false;
@@ -282,7 +284,7 @@ namespace DIYLevelFastInit
                         Maintain(state);
                     }
                     catch (OperationCanceledException) { return; }
-                    catch (Exception error) { Log(state, "bundle file cache worker: " + error.Message); }
+                    catch (Exception error) { Log(state, "bundle file cache worker: " + error); }
                     finally { if (entry != null) lock (state.Sync) entry.Queued = false; }
                 }
             }
@@ -296,6 +298,7 @@ namespace DIYLevelFastInit
         private static FileStream TryLock(string path)
         {
             try { return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+            catch (IsolatedStorageException) { return null; }
             catch (IOException) { return null; }
             catch (UnauthorizedAccessException) { return null; }
         }
@@ -355,6 +358,7 @@ namespace DIYLevelFastInit
         private static bool MatchesSource(Entry entry)
         {
             try { FileInfo file = new FileInfo(entry.Source); return file.Exists && file.Length == entry.SourceLength && file.LastWriteTimeUtc.Ticks == entry.SourceTicks; }
+            catch (IsolatedStorageException) { return false; }
             catch (IOException) { return false; }
             catch (UnauthorizedAccessException) { return false; }
         }
@@ -383,7 +387,8 @@ namespace DIYLevelFastInit
 
         private static Metadata ReadMetadata(Entry entry)
         {
-            try { return ReadMetadataFile(entry.Metadata, entry); }
+            try { return File.Exists(entry.Metadata) ? ReadMetadataFile(entry.Metadata, entry) : null; }
+            catch (IsolatedStorageException) { return null; }
             catch (IOException) { return null; }
             catch (UnauthorizedAccessException) { return null; }
         }
@@ -415,6 +420,7 @@ namespace DIYLevelFastInit
                 return output.Exists && output.Length == metadata.OutputLength && Same(HashFile(state, entry.Source), metadata.SourceHash)
                     && Same(HashFile(state, entry.Bundle), metadata.OutputHash) && MatchesSource(entry);
             }
+            catch (IsolatedStorageException) { return false; }
             catch (IOException) { return false; }
             catch (UnauthorizedAccessException) { return false; }
         }
@@ -456,10 +462,12 @@ namespace DIYLevelFastInit
         {
             try
             {
+                if (!File.Exists(entry.BadFile)) return false;
                 using (BinaryReader reader = new BinaryReader(File.OpenRead(entry.BadFile)))
                     return reader.BaseStream.Length == 24 && reader.ReadInt32() == BadMagic && reader.ReadInt32() == Schema
                         && reader.ReadInt64() == entry.SourceLength && reader.ReadInt64() == entry.SourceTicks;
             }
+            catch (IsolatedStorageException) { return false; }
             catch (IOException) { return false; }
             catch (UnauthorizedAccessException) { return false; }
         }
@@ -478,6 +486,7 @@ namespace DIYLevelFastInit
                 {
                     if (touch && File.Exists(entry.Metadata)) File.SetLastWriteTimeUtc(entry.Metadata, new DateTime(entry.LastUse, DateTimeKind.Utc));
                 }
+                catch (IsolatedStorageException) { }
                 catch (IOException) { }
                 catch (UnauthorizedAccessException) { }
             }
@@ -508,6 +517,7 @@ namespace DIYLevelFastInit
                         finally { Delete(temporary); }
                     }
                 }
+                catch (IsolatedStorageException) { }
                 catch (IOException) { }
                 catch (UnauthorizedAccessException) { }
             }
@@ -585,6 +595,7 @@ namespace DIYLevelFastInit
         private static bool Delete(string path)
         {
             try { File.Delete(path); return !File.Exists(path); }
+            catch (IsolatedStorageException) { return false; }
             catch (IOException) { return false; }
             catch (UnauthorizedAccessException) { return false; }
         }

@@ -4,6 +4,12 @@ Startup and memory optimization for the [OC2DIYLevel](https://github.com/gua248/
 
 [中文说明](README_CN.md)
 
+## Version 1.6.15
+
+Fixes first-time LZ4 cache creation on the game's bundled Mono runtime. Missing files/paths can throw `IsolatedStorageException`, which is not an `IOException`; checking an absent `.bad` or `.meta` previously aborted the job and left only `.lock`. The source reader also used a `FileOptions` constructor overload missing from this runtime; it now uses the supported five-argument overload. Missing files now produce a normal cache miss, and compatibility handling also covers files disappearing after the existence check. Worker errors retain their type/stack, and startup logs show the enabled cache directory.
+
+Completed entries live under `BepInEx/cache/DIYLevelFastInit/bundles/` as hash-named `.bundle`/`.meta` pairs, not `.lz4` files. Only supported `info_dmm` files are currently converted. Leave `Loading.EnableLz4BundleCache=true` and allow the frontend to idle after discovery/source-thumbnail work; entry/gameplay pauses conversion. `bundle file cache built` confirms publication, and `info bundle source: info_dmm (LZ4 cache)` confirms use. Existing `.lock` files can remain.
+
 ## Version 1.6.14
 
 Entry, uncached previews and thumbnail prewarming now request the selected `LevelInfoSO` asset directly. The complete lightweight catalog and its stable SO identities remain unchanged. Each info container indexes asset basenames once per loaded set; only a unique match for the catalog object's name is used, and the loaded object's type, name and scene must agree. Missing, ambiguous or invalid addresses fall back to the original full `LevelSetInfo`. Same-target requests are shared; different levels have separate pending requests. Cancellation drains native requests before dropping their pins and cannot start an obsolete fallback.
@@ -80,6 +86,8 @@ Output: `bin/Release/DIYLevelFastInit.dll`. Targets .NET Framework 3.5 and C# 7.
 `FastInitPlugin` and `OnDemandResources` retain their type names through partial declarations. Shared fields and initializers remain in their core files in the original order. SDK default source inclusion compiles all files into the same plugin DLL.
 
 ## Verification
+
+Version 1.6.15 passes the Release build, 39 old-Mono file-exception compatibility assertions, the existing 156 cache-manager assertions and installed-runtime compatibility checks including 31 Harmony signatures. A separate x86 host loads the actual game `mono.dll`/corlib (runtime 2.0.50727.1433): the old manager reproduces the missing `.bad` failure; fixed production cache/codec sources build a fresh 110,259,016-byte DMM cache (26,007 ms for that isolated conversion), then validate and reuse it after manager reinitialization without reconversion. Records are under `../.verification/cache-1.6.15/`. This exercises actual Mono file/conversion behavior without launching the game or executing Unity native AssetBundle loading; conversion duration is not level-entry latency.
 
 Version 1.6.14 passes 45 asset-index assertions (including ten real DMM object/address mappings), 22 production-loader scenarios, 42 preview/warmup assertions, 31 lifetime assertions and 18 background-cache eligibility assertions. The loader/consumer/lifetime native boundaries use fakes; the lifetime check compiles four verbatim production methods. Network, server and frontend regressions retain 59 assertions, 13 scenarios and 96 assertions respectively (including the final assembly-version check). Detailed sources, results and the final assembly manifest are under `../.verification/level-1.6.14/`. These checks establish managed request behavior and installed API compatibility; game-native load acceptance, actual time/memory savings and two-player Steam regression remain untested. No deployed game files were changed.
 
