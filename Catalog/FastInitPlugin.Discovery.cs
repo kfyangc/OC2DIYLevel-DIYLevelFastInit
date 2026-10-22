@@ -38,6 +38,7 @@ namespace DIYLevelFastInit
                 yield break;
             }
             result.InfoFile = files[0];
+            BundleFileCache.Queue(result.InfoFile.FullName);
             result.So = LevelCatalogCache.TryRead(dir, result.InfoFile);
             if (result.So != null) yield break;
 

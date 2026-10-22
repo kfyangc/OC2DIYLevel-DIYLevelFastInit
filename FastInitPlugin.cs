@@ -20,7 +20,7 @@ namespace DIYLevelFastInit
     {
         public const string PluginGuid = "oc2.diylevel.fastinit";
         public const string PluginName = "DIYLevel FastInit";
-        public const string PluginVersion = "1.6.12";
+        public const string PluginVersion = "1.6.13";
 
         internal static ManualLogSource Log;
 
@@ -78,6 +78,7 @@ namespace DIYLevelFastInit
                     prefix: new HarmonyMethod(typeof(FastInitPlugin), nameof(SetupDirectoryPrefix)));
                 OnDemandResources.Install(harmony);
                 _patchesReady = true;
+                ConfigureBundleCache();
                 Log.LogInfo("DIYLevel FastInit ready: lightweight catalog, on-demand level resources.");
             }
             catch (Exception e)
@@ -99,6 +100,7 @@ namespace DIYLevelFastInit
             ClientLoadGate.Cancel("plugin shutdown");
             OnDemandResources.CancelServerPreparation("plugin shutdown");
             OnDemandResources.RestoreEntryPriority("plugin shutdown");
+            BundleFileCache.Shutdown();
         }
     }
 }

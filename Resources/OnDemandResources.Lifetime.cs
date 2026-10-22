@@ -148,6 +148,7 @@ namespace DIYLevelFastInit
                 if (retained.Contains(path)) continue;
                 InfoBundles[path].Unload(false);
                 InfoBundles.Remove(path);
+                ReleaseInfoBundleLease(path);
                 RequestCleanup();
                 FastInitPlugin.Log.LogInfo("info dependency released: " + Path.GetFileName(path)
                     + " (" + InfoBundles.Count + " bundles tracked)");

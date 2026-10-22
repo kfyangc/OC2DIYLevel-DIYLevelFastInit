@@ -4,7 +4,13 @@ Startup and memory optimization for the [OC2DIYLevel](https://github.com/gua248/
 
 [中文说明](README_CN.md)
 
-## Version 1.6.12
+## Version 1.6.13
+
+Adds a disposable LZ4 file cache for the installed `info_dmm` layout. A miss immediately loads the original file and queues conversion; one low-priority managed worker runs only while foreground loading and gameplay are idle. The original map is never overwritten. Cache entries are verified against source/output SHA-256 hashes once per process in the background, published with validated metadata, and limited to 512 MiB of published data. Unity bundle requests and resident containers pin their cache files until completion/unload. Rejected copies fall back to the original source and remain disabled for that source fingerprint.
+
+Cache location: `BepInEx/cache/DIYLevelFastInit/bundles/`. Set `Loading.EnableLz4BundleCache=false` in the plugin configuration and restart to disable it, or delete the cache while the game is closed. Only supported single-block LZMA `info_dmm` files are converted; small scene bundles and other packages retain their original loaders. Conversion uses bounded streaming buffers and preserves directory nodes, CAB names and uncompressed resource bytes. The first use can still load from the original file while conversion/validation is pending. This revision does not reduce the `LevelSetInfo` object graph.
+
+The cancellation/save-handshake fixes from 1.6.12 remain in place:
 
 This revision fixes load-request ownership across cancellation and reconnection, following Team17's per-connection loading and readiness flow:
 
@@ -63,11 +69,14 @@ Output: `bin/Release/DIYLevelFastInit.dll`. Targets .NET Framework 3.5 and C# 7.
 | `Resources/` | Info bundles, configurations, entry, lifetime cleanup and dependency adapters |
 | `Previews/` | Preview requests, thumbnail warmup and disk cache |
 | `Diagnostics/`, `Infrastructure/` | Material auditing, coroutine host and async helpers |
-| `BundleCodecs/` | LZMA SDK decoder subset and its supporting types |
+| `BundleCodecs/` | LZMA decoder, streaming UnityFS repacker and LZ4 block encoder |
 
 `FastInitPlugin` and `OnDemandResources` retain their type names through partial declarations. Shared fields and initializers remain in their core files in the original order. SDK default source inclusion compiles all files into the same plugin DLL.
 
 ## Verification
+
+Version 1.6.13 passes the Release build and existing installed-runtime compatibility checks, including 31 Harmony wrappers. An isolated x86 conversion of the real DMM bundle preserves all 161,349,396 uncompressed bytes, node directories, and all 787 object records/external references checked independently with liblzma, python-lz4 and UnityPy. Output is 110,259,016 bytes in 1,231 blocks (original: 95,522,720 bytes); this is an on-disk format check, not an in-game latency or memory benchmark. Production info-loader code also passes 26 assertions with fake Unity/cache boundaries. Detailed converter, manager and integration checks are under `../.verification/cache-1.6.13/`. No game launch or deployment was performed; Unity 2017 native acceptance and host/client loading times remain to be measured.
+
 
 Version 1.6.12 passed a Release build, 59 network transition assertions against the production gate/queue, 13 server preparation scenarios against the production iterators, and 95 frontend assertions using installed managed game types and the production request policies. The same network harness reproduces the cancelled-request save-ready failure with 1.6.11 sources; the server baseline fails all 11 cancellation scenarios while passing its two normal-entry scenarios. Existing cache, thumbnail, copied-message, save-selection and 31 Harmony wrapper checks also pass; the handoff check now keeps the save-state guard until target scene arrival.
 

@@ -75,10 +75,22 @@ namespace DIYLevelFastInit
         private static bool _directoryBuild;
         private static bool _cleanupQueued, _cleanupRequested;
         private static long _serverPreparationGeneration;
+        private static readonly Dictionary<string, BundleFileCache.Lease> InfoBundleLeases = new Dictionary<string, BundleFileCache.Lease>(StringComparer.OrdinalIgnoreCase);
 
         internal static bool IsTransitioning { get { return _pendingScene != null; } }
         internal static bool IsClientTransition { get { return IsTransitioning && !ConnectionStatusPublicizer.IsHost() && ConnectionStatusPublicizer.IsInSession(); } }
         internal static bool HasDiySaveSelection { get { return _visibleSaveDialog != null && _visibleSaveDialog.DLC == 15; } }
+        internal static bool CanBuildBundleCache
+        {
+            get
+            {
+                return !FastInitPlugin.Loading && !FastInitPlugin.Syncing && !IsTransitioning
+                    && !PseudoPrefabManager.isInCustomLevel && !_serverPreparing
+                    && _catalogBundles == null && _previewBundles == null && _warmBundles == null
+                    && PendingBundles.Count == 0 && PendingInfos.Count == 0
+                    && Time.realtimeSinceStartup - _lastPreviewTime >= 0.5f;
+            }
+        }
 
         internal static void Install(Harmony harmony)
         {

@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.12 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.13 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -18,7 +18,7 @@ the progress indicator, and incremental hot reload remain supported.
 - `Previews/`: preview requests, thumbnail warmup and the persistent thumbnail cache.
 - `Diagnostics/`: material auditing.
 - `Infrastructure/`: coroutine host, async request helpers and result boxes.
-- `BundleCodecs/`: the attributed LZMA SDK decoder subset.
+- `BundleCodecs/`: the attributed LZMA decoder, UnityFS repacker and LZ4 encoder.
 
 `FastInitPlugin` and `OnDemandResources` use partial files to retain their existing
 reflection and Harmony contracts. Keep their fields/initializers together, in their
@@ -278,6 +278,22 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   `Instance`, `levelSetSelectionMenu`, and method `AddLevelSetButton`. These names are the
   contract with the compiled OC2DIYLevel 0.10.0 — if that plugin updates, re-verify against
   its decompiled source at `C:\Users\yang\.cache\OC2DIYLevel-decompiled\OC2DIYLevel_src\`.
+
+## Disposable bundle cache
+
+- `BundleFileCache` is pure managed code. Its single low-priority worker must not call
+  Unity/BepInEx APIs; `Tick` gates idle work and forwards queued diagnostics on the main thread.
+- Only supported single-block LZMA `info_dmm` sources are eligible. Keep all original
+  path keys, CAB names, dependencies and source files intact. Cache misses must return
+  the original path without waiting for conversion or whole-file hash validation.
+- Cache files are leased through both native request completion and loaded container
+  lifetime. Release the lease after `Unload(false)`, never when an async wait is cancelled.
+  Retry original input only after the cached native request completes or fails to start.
+- Validate source/output hashes off-thread, publish metadata last, retain fingerprinted
+  rejection markers, and respect the 512 MiB published-data budget. Interrupted temporary
+  files may be removed only while holding the matching cross-process lock.
+- `UnityFsRepacker` streams 128 KiB blocks using the original bounded LZMA dictionary;
+  never reuse the graph reader's prefix-only decoder clamp or retain the entire payload.
 
 ## Constraints
 
