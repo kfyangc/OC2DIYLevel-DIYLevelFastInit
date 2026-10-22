@@ -21,27 +21,91 @@ namespace DIYLevelFastInit
             }
         }
 
-        internal static IEnumerator FinishSaveSelection(Func<bool> current, string context)
+        internal static IEnumerator FinishSaveSelection(Func<bool> current, string context, Action<SaveSelectionView> capture = null)
         {
             T17FrontendFlow flow = T17FrontendFlow.Instance;
             if (flow == null || !current()) yield break;
-            GameStateMessage.ClientSavePayload payload = ClientSavePayload.GetValue(flow) as GameStateMessage.ClientSavePayload;
-            if (payload != null && payload.DLCID == 15) ClientSavePayload.SetValue(flow, null);
-            ClientCountdown.SetValue(flow, false);
-            flow.HideWaitingForPlayers();
-            HashSet<SelectSaveDialog> dialogs = new HashSet<SelectSaveDialog> { _visibleSaveDialog,
-                OnlineSaveDialog.GetValue(flow) as SelectSaveDialog, LocalSaveDialog.GetValue(flow) as SelectSaveDialog };
-            foreach (SelectSaveDialog dialog in dialogs)
+            SaveSelectionView view = null;
+            bool ready = false;
+            try
             {
-                if (!current()) yield break;
-                if (dialog == null || dialog.DLC != 15) continue;
-                yield return SaveSelectionState.CloseWhenReady(current,
-                    () => dialog == null || !dialog.gameObject.activeSelf || dialog.Hide(false));
+                GameStateMessage.ClientSavePayload payload = ClientSavePayload.GetValue(flow) as GameStateMessage.ClientSavePayload;
+                if (payload != null && payload.DLCID == 15) ClientSavePayload.SetValue(flow, null);
+                ClientCountdown.SetValue(flow, false);
+                view = HoldSaveSelectionView(flow, null);
+                if (capture != null) capture(view);
+                flow.HideWaitingForPlayers();
+                HashSet<SelectSaveDialog> dialogs = new HashSet<SelectSaveDialog> { _visibleSaveDialog,
+                    OnlineSaveDialog.GetValue(flow) as SelectSaveDialog, LocalSaveDialog.GetValue(flow) as SelectSaveDialog };
+                foreach (SelectSaveDialog dialog in dialogs)
+                {
+                    if (!current()) yield break;
+                    if (dialog == null || dialog.DLC != 15) continue;
+                    yield return SaveSelectionState.CloseWhenReady(current,
+                        () => dialog == null || !dialog.gameObject.activeSelf || dialog.CanHide());
+                }
+                ready = current();
+                if (ready) FastInitPlugin.Log.LogInfo("DIY " + context + " save UI retained with input locked during resource preparation");
             }
-            if (current()) FastInitPlugin.Log.LogInfo("DIY " + context + " save UI closed before resource preparation");
+            finally { if (!ready) EndSaveSelectionView(view, true); }
         }
 
-        internal static void ResetSaveSelection() { SaveSelection.Reset(); }
+        internal static SaveSelectionView CaptureSaveSelectionView() { return _saveSelectionView; }
+
+        internal static void EndSaveSelectionView(SaveSelectionView expected, bool restore)
+        {
+            if (expected == null || !ReferenceEquals(expected, _saveSelectionView)) return;
+            if (restore) SaveSelection.Reset();
+            try { expected.Release(restore); }
+            finally { if (ReferenceEquals(expected, _saveSelectionView)) _saveSelectionView = null; }
+        }
+
+        internal static void ResetSaveSelection()
+        {
+            SaveSelection.Reset();
+            EndSaveSelectionView(_saveSelectionView, false);
+        }
+
+        private static SaveSelectionView HoldSaveSelectionView(T17FrontendFlow flow, SelectSaveDialog selected)
+        {
+            if (flow == null) return null;
+            SaveSelectionView view = _saveSelectionView;
+            if (view == null || view.Released || !ReferenceEquals(view.Flow, flow))
+            {
+                EndSaveSelectionView(view, false);
+                view = new SaveSelectionView(flow);
+                _saveSelectionView = view;
+            }
+            HashSet<SelectSaveDialog> dialogs = new HashSet<SelectSaveDialog> { selected, _visibleSaveDialog,
+                OnlineSaveDialog.GetValue(flow) as SelectSaveDialog, LocalSaveDialog.GetValue(flow) as SelectSaveDialog };
+            try
+            {
+                foreach (SelectSaveDialog dialog in dialogs)
+                    if (dialog != null && dialog.DLC == 15) view.Hold(dialog);
+            }
+            catch
+            {
+                EndSaveSelectionView(view, true);
+                throw;
+            }
+            return view;
+        }
+
+        private static SaveSelectionCallback BeginSaveSelectionCallback(SelectSaveDialog dialog)
+        {
+            T17FrontendFlow flow = T17FrontendFlow.Instance;
+            if (flow == null) return null;
+            SaveSelection.ObserveRequest(flow, 15);
+            return new SaveSelectionCallback(flow, HoldSaveSelectionView(flow, dialog), SaveSelection.Revision);
+        }
+
+        private static bool IsCurrentSaveSelectionCallback(SaveSelectionCallback callback)
+        {
+            return callback != null && ReferenceEquals(callback.Flow, T17FrontendFlow.Instance)
+                && callback.Revision == SaveSelection.Revision && SaveSelection.IsDiyRequest(callback.Flow)
+                && ReferenceEquals(callback.View, _saveSelectionView)
+                && (callback.View == null || !callback.View.Released);
+        }
 
         private static bool SelectionPrefix()
         {
@@ -76,10 +140,17 @@ namespace DIYLevelFastInit
             FastInitPlugin.Log.LogInfo("DIY save dialog opened: id=" + __instance.GetInstanceID() + ", frame=" + Time.frameCount);
         }
 
-        private static void SaveDialogHidePrefix(SelectSaveDialog __instance, ref bool restoreInvokerState, out bool __state)
+        private static bool SaveDialogHidePrefix(SelectSaveDialog __instance, ref bool restoreInvokerState, ref bool __result, out bool __state)
         {
             __state = __instance.DLC == 15 && __instance.gameObject.activeSelf;
-            if (__instance.DLC == 15 && IsSaveEntryActive) restoreInvokerState = false;
+            SaveSelectionView view = _saveSelectionView;
+            if (view != null && view.Holds(__instance))
+            {
+                __result = false;
+                return false;
+            }
+            if (__instance.DLC == 15 && IsSaveEntryActive && (view == null || !view.IsRestoring(__instance))) restoreInvokerState = false;
+            return true;
         }
 
         private static void SaveDialogHidePostfix(SelectSaveDialog __instance, bool __state, bool __result)
@@ -97,9 +168,39 @@ namespace DIYLevelFastInit
             FastInitPlugin.Log.LogInfo("DIY save choice confirmed; client save countdown stopped");
         }
 
-        private static void DontSavePostfix(SelectSaveDialog __instance)
+        private static bool DontSavePrefix(SelectSaveDialog __instance, out SaveSelectionCallback __state)
         {
-            if (__instance.DLC == 15) ConfirmSaveSelection();
+            __state = null;
+            if (__instance.DLC != 15) return true;
+            if (SaveSelection.IsConfirmed(T17FrontendFlow.Instance) || IsSaveEntryActive || SaveReadyCallbacks.Count != 0
+                || (_saveSelectionView != null && _saveSelectionView.HasDontSaveScope)) return false;
+            __state = BeginSaveSelectionCallback(__instance);
+            if (__state != null && __state.View != null) __state.View.BeginDontSave(__instance);
+            return true;
+        }
+
+        private static void DontSavePostfix(SelectSaveDialog __instance, SaveSelectionCallback __state)
+        {
+            if (__instance.DLC == 15 && IsCurrentSaveSelectionCallback(__state)) ConfirmSaveSelection();
+        }
+
+        private static Exception DontSaveFinalizer(SelectSaveDialog __instance, SaveSelectionCallback __state, Exception __exception)
+        {
+            if (__state != null && __state.View != null)
+            {
+                __state.View.EndDontSave(__instance);
+                if (__exception != null) EndSaveSelectionView(__state.View, true);
+            }
+            return __exception;
+        }
+
+        private static bool SaveDialogForceClosePrefix(SelectSaveDialog __instance)
+        {
+            SaveSelectionView view = _saveSelectionView;
+            if (view == null || !view.Holds(__instance)) return true;
+            if (view.IsDontSaveScope(__instance)) return false;
+            ResetSaveSelection();
+            return true;
         }
 
         private static void ServerSaveStatePostfix(Serialisable message)
@@ -159,32 +260,41 @@ namespace DIYLevelFastInit
         {
             SaveSelection.ObserveRequest(flow, dlc);
             if (dlc == 15) return true;
+            EndSaveSelectionView(_saveSelectionView, true);
             _visibleSaveDialog = null;
             ClientLoadGate.Cancel("official save selection requested");
             CancelServerPreparation("official save selection requested");
             return false;
         }
 
-        private static bool SaveReadyPrefix(SaveSlotElement __instance, out bool __state)
+        private static bool SaveReadyPrefix(SaveSlotElement __instance, out SaveSelectionCallback __state)
         {
-            __state = false;
+            __state = null;
             if (__instance.DLC != 15) return true;
             if (__instance.SaveGameReady || SaveSelection.IsConfirmed(T17FrontendFlow.Instance) || IsSaveEntryActive
+                || (_saveSelectionView != null && _saveSelectionView.HasDontSaveScope)
                 || SaveReadyCallbacks.Count != 0 || !SaveReadyCallbacks.Add(__instance))
             {
                 FastInitPlugin.Log.LogInfo("duplicate DIY save confirmation ignored");
                 return false;
             }
-            __state = true;
+            try { __state = BeginSaveSelectionCallback(null); }
+            catch
+            {
+                SaveReadyCallbacks.Remove(__instance);
+                throw;
+            }
+            if (__state == null) SaveReadyCallbacks.Remove(__instance);
             return true;
         }
 
-        private static Exception SaveReadyFinalizer(SaveSlotElement __instance, bool __state, Exception __exception)
+        private static Exception SaveReadyFinalizer(SaveSlotElement __instance, SaveSelectionCallback __state, Exception __exception)
         {
-            if (__state)
+            if (__state != null)
             {
                 SaveReadyCallbacks.Remove(__instance);
-                if (__exception == null && __instance.SaveGameReady) ConfirmSaveSelection();
+                if (__exception == null && __instance.SaveGameReady && IsCurrentSaveSelectionCallback(__state)) ConfirmSaveSelection();
+                else if (__exception != null || !__instance.SaveGameReady) EndSaveSelectionView(__state.View, true);
             }
             return __exception;
         }

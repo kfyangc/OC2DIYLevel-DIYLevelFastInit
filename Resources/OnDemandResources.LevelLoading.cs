@@ -65,6 +65,7 @@ namespace DIYLevelFastInit
             catch (Exception e)
             {
                 _pendingScene = null;
+                EndSaveSelectionView(CaptureSaveSelectionView(), true);
                 FastInitPlugin.Log.LogError("DIY level preparation failed [" + sceneName + "]: " + e);
                 ReleaseUnused();
                 throw;
@@ -95,19 +96,21 @@ namespace DIYLevelFastInit
         {
             if (!_serverPreparing) return;
             _serverPreparationGeneration++;
+            EndSaveSelectionView(CaptureSaveSelectionView(), true);
             FastInitPlugin.Log.LogInfo("DIY server level preparation cancelled: " + reason);
         }
 
         private static IEnumerator PrepareServerLevel(string path, string scene, ServerPreparation request)
         {
             bool resumed = false;
+            SaveSelectionView view = CaptureSaveSelectionView();
             try
             {
                 yield return null;
                 FastInitPlugin.Log.LogInfo("async level preparation started: " + scene);
                 Func<bool> current = () => request.IsCurrent(scene);
                 if (!current()) yield break;
-                yield return FinishSaveSelection(current, "server");
+                yield return FinishSaveSelection(current, "server", owned => view = owned);
                 if (!current()) yield break;
                 CancelPreview();
                 ThumbnailCache.ClearMemory();
@@ -136,6 +139,7 @@ namespace DIYLevelFastInit
                 _preparingBundles = null;
                 if (!resumed)
                 {
+                    EndSaveSelectionView(view, true);
                     if (!ClientLoadGate.Running) _pendingScene = null;
                     RestoreEntryPriority("preparation interrupted");
                 }

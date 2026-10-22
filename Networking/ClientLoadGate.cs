@@ -101,6 +101,7 @@ namespace DIYLevelFastInit
         private static IEnumerator Prepare()
         {
             bool handedOff = false;
+            OnDemandResources.SaveSelectionView view = null;
             try
             {
                 while (Queue.Pending != null)
@@ -114,6 +115,7 @@ namespace DIYLevelFastInit
                         Queue.CancelRequest(request);
                         continue;
                     }
+                    view = OnDemandResources.CaptureSaveSelectionView();
                     NetworkConnection connection = (NetworkConnection)request.Connection;
                     bool paused = connection.GetLatencyTestPaused();
                     MultiplayerController controller = GameUtils.RequestManager<MultiplayerController>();
@@ -127,7 +129,7 @@ namespace DIYLevelFastInit
                         if (Queue.AnnounceStart(request, state => _sendState.Invoke(null, new object[] { state })))
                             FastInitPlugin.Log.LogInfo("DIY client loading acknowledged before resources: " + request.Message.m_Scene
                                 + " (" + request.Message.m_StartLoadGameState + ")");
-                        yield return OnDemandResources.FinishSaveSelection(() => IsCurrent(request), "client");
+                        yield return OnDemandResources.FinishSaveSelection(() => IsCurrent(request), "client", owned => view = owned);
                         if (!IsCurrent(request)) continue;
                         Box<bool> ready = new Box<bool>();
                         yield return FastInitHost.Guard(OnDemandResources.PrepareClientLevel(request.Path, request.Message.m_Scene,
@@ -151,6 +153,7 @@ namespace DIYLevelFastInit
             finally
             {
                 if (!handedOff) Queue.CancelRequest(_active);
+                if (!handedOff) OnDemandResources.EndSaveSelectionView(view, true);
                 _active = null;
                 Running = false;
                 OnDemandResources.EndClientPreparation(handedOff);
@@ -211,8 +214,11 @@ namespace DIYLevelFastInit
         internal static void Cancel(string reason)
         {
             if (Queue.Pending == null && Queue.Transition == null) return;
+            OnDemandResources.SaveSelectionView view = _clientMailbox != null && IsIdentityCurrent(Queue.Transition)
+                ? OnDemandResources.CaptureSaveSelectionView() : null;
             FastInitPlugin.Log.LogInfo("DIY client level preparation cancelled: " + reason);
             Queue.Cancel();
+            OnDemandResources.EndSaveSelectionView(view, true);
         }
     }
 }

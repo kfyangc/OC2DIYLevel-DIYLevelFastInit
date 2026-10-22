@@ -4,6 +4,14 @@
 
 [English README](README.md)
 
+## 1.6.17 的优化与界面修复
+
+将 1.6.16 的 LZ4 缓存扩展到所有兼容的 DIY `info*` 包，不再限定 DMM。保留格式版本 2，已有的有效 DMM 缓存可以继续复用。当前安装的 20 个 info 包全部支持；不支持的格式在本次进程内记住并回退原件，小场景包、`common*` 和七池运行库持有的独立资源包仍由原加载器处理。
+
+缓存预算默认提高到 2 GiB，可通过 `Loading.Lz4BundleCacheSizeMiB` 调整（128–16384 MiB，重启生效）。本机 20 包转换后共 575.27 MiB，旧的 512 MiB 上限无法同时容纳。后台先校验已有缓存，再转换未命中的包；扫描排队不会刷新已有条目的最近使用时间或占用文件租约。仍需在前端空闲时等待生成／校验，未就绪时立即使用原件。
+
+修复确认存档后选档框提前消失的问题：在确认回调开始时保留选档框，并使用 Team17 的事件系统 suppressor 锁住输入；存档读写和界面 Update 继续运行。准备资源期间只等待存档例程完成，不提前 `Hide(false)`；真正切图后释放自己的输入锁。覆盖“不保存”路径，并在取消、失败、断线或改选官方关卡时释放当前请求的界面锁，旧请求的收尾不会释放新请求的锁。
+
 ## 1.6.16 的修复
 
 修复已生成 LZ4 缓存却仍使用原文件的问题。1.6.13–1.6.15 把原始 LZMA 数据块的 `Streamed=0x40` 标记沿用到独立 LZ4／未压缩分块，游戏原生读取器因此调用不支持的 LZ4 流式解压路径，报 `Failed to decompress data for the AssetBundle` 并写下 `.bad`，后续一直回退原文件。现在新分块只写压缩类型 `0x02`／`0x00`，保留其余压缩字节和资源内容。
@@ -16,7 +24,7 @@
 
 修复 1.6.13／1.6.14 在游戏自带 Mono 上无法首次生成 LZ4 缓存的问题：该运行库对缺失文件／路径可能抛出 `IsolatedStorageException`，它不继承 `IOException`。原实现检查不存在的 `.bad`／`.meta` 时中断任务，目录里仅留下 `.lock`。转码器的源读取还使用了该运行库缺失的 `FileOptions` 构造函数重载，现改用实际支持的五参数重载。现在缺失文件正常视为未命中，同时处理检查后文件消失的竞态；错误日志保留异常类型和堆栈，启动时记录缓存启用状态与实际目录。
 
-缓存位置是 `BepInEx/cache/DIYLevelFastInit/bundles/`，完成后为哈希文件名的 `.bundle` 和 `.meta`，不是 `.lz4` 扩展名。当前仅转换支持的 `info_dmm`。保持 `Loading.EnableLz4BundleCache=true`，目录扫描／缩略图源加载结束后留在空闲前端即可生成；进图或游玩会暂停转换。日志 `bundle file cache built` 表示生成完成，后续 `info bundle source: info_dmm (LZ4 cache)` 表示本次加载使用了缓存。已有 `.lock` 不必删除。
+缓存位置是 `BepInEx/cache/DIYLevelFastInit/bundles/`，完成后为哈希文件名的 `.bundle` 和 `.meta`，不是 `.lz4` 扩展名。1.6.15 仅转换支持的 `info_dmm`；1.6.17 已扩展到所有兼容的 `info*`。保持 `Loading.EnableLz4BundleCache=true`，目录扫描／缩略图源加载结束后留在空闲前端即可生成；进图或游玩会暂停转换。日志 `bundle file cache built` 表示生成完成，后续 `info bundle source: info_dmm (LZ4 cache)` 表示本次加载使用了缓存。已有 `.lock` 不必删除。
 
 ## 1.6.14 的优化
 
@@ -28,7 +36,7 @@
 
 为安装中的 `info_dmm` 格式增加可丢弃的 LZ4 文件缓存。未命中时立即加载原文件并排队转换；单个低优先级托管线程只在前台加载和游戏空闲时工作，不覆盖地图原件。每个进程首次使用缓存前在后台验证源文件和输出的 SHA-256，完成后发布已校验的元数据，已发布数据上限为 512 MiB。Unity 原生请求和已加载容器会持续占用缓存文件，直到请求完成／容器卸载。Unity 拒绝缓存时回退原文件，并禁用该源指纹对应的缓存。
 
-缓存位于 `BepInEx/cache/DIYLevelFastInit/bundles/`。配置中将 `Loading.EnableLz4BundleCache=false` 后重启可禁用；关闭游戏后可直接删除缓存。当前仅转换支持的单块 LZMA `info_dmm`，小场景包和其他关卡保持原加载方式。转换采用有界流式缓冲，保留节点目录、CAB 名称与解压后的资源字节。转换或校验尚未完成时，本次进图仍可能使用原件。暂停中的转换会保留源文件读句柄，直到继续或退出；期间 Windows 可能阻止覆盖该源文件。1.6.13 负责文件解压优化；1.6.14 另加入上述对象加载范围优化。
+缓存位于 `BepInEx/cache/DIYLevelFastInit/bundles/`。配置中将 `Loading.EnableLz4BundleCache=false` 后重启可禁用；关闭游戏后可直接删除缓存。1.6.13 当时仅转换支持的单块 LZMA `info_dmm`；1.6.17 已扩展到兼容的 `info*`，小场景包仍保持原加载方式。转换采用有界流式缓冲，保留节点目录、CAB 名称与解压后的资源字节。转换或校验尚未完成时，本次进图仍可能使用原件。暂停中的转换会保留源文件读句柄，直到继续或退出；期间 Windows 可能阻止覆盖该源文件。1.6.13 负责文件解压优化；1.6.14 另加入上述对象加载范围优化。
 
 保留 1.6.12 的取消和选档同步修复：
 
@@ -53,7 +61,7 @@
 - **七池独立资源**：读取 `info_qichi` 前，先通过已安装的七池运行库（v10 接口）准备独立的 `qichi_assets`。等待已有异步请求，或复用已加载的包，并同步运行库的完成状态，避免反复重复加载。冷扫描、源图预览和单机／房主、客户端进图均覆盖；资源包仍由七池运行库持有，FastInit 不卸载。缺少运行库时记录提示；已安装的加载器接口不兼容或请求失败时，中止本次资源准备。
 - **资源回收**：按场景是否仍在使用决定何时释放 info、配置和运行时 prefab。info 包解除引用并 `Unload(false)` 后，合并清理请求，在前端由 `Resources.UnloadUnusedAssets()` 回收无引用对象，保留仍被使用的材质和 Shader；不在 DIY 关卡或切图中主动启动这项清理。切图允许新旧资源短暂重叠；每次重开产生的场景运行时对象按场景实例回收。
 - **提前生成缩略图**：内置对 OC2StageThumbnailPreview 1.0.0 的适配。目录加载完成后，自动逐个关卡集提前生成小图，写入 `BepInEx/cache/DIYLevelFastInit/thumbnails/`，无需先逐张浏览；屏幕显示缓存进度。支持直接地址时每关完成即释放源资源并等待回收，旧包全量回退按批次回收。之后浏览直接读取硬盘上的小图，最大 640 × 360；内存最多保留最近 8 张，进入关卡时清空，硬盘最多 128 MiB，超限淘汰最旧条目。按 info/common 源文件指纹判断过期，校验图片尺寸、长度和校验和。后台生成会为游戏、切图和未缓存的前台预览暂停；已缓存的图片可直接读取，无需等待正在进行的预生成。缺失或无效缓存回退到异步读取源包。快速切换只显示最新选中的图片；排序插件仍使用原有的轻量 SO 对象。
-- **选档与加载衔接**：拦截同帧重复选关、已打开或切图期间的重复选档请求，以及重复的存档确认。完成选择（含“不保存”）后记住本轮结果并停止客机选档倒计时；重复收到房主请求时复用已选存档并补发就绪回执，进入加载后不再补发旧选档状态。单机／房主与客机在准备资源前都通过 `Hide(false)` 正常关闭选档和等待界面；若存档读写仍在处理，每帧等待其可清理，不强行中断，关闭时不恢复旧的上级界面。客机先回复“开始加载”，资源就绪后只恢复一次切图消息；“关卡已就绪”仍由原始场景流程通知。新选关、连接重置和场景到达清除本轮选择记录。只作用于 DIY DLC 15；确认前取消仍可重新选择。
+- **选档与加载衔接**：拦截同帧重复选关、已打开或切图期间的重复选档请求，以及重复的存档确认。完成选择（含“不保存”）后记住本轮结果并停止客机选档倒计时；重复收到房主请求时复用已选存档并补发就绪回执，进入加载后不再补发旧选档状态。单机／房主与客机确认存档后保留选档框并锁住输入；只隐藏等待覆盖层，不提前关闭选档框。若存档读写仍在处理，每帧等待其完成，继续运行其 Update。切图后释放自己的输入锁，取消或失败按请求身份恢复界面。客机先回复“开始加载”，资源就绪后只恢复一次切图消息；“关卡已就绪”仍由原始场景流程通知。新选关、连接重置和场景到达清除本轮选择记录。只作用于 DIY DLC 15；确认前取消仍可重新选择。
 - **热刷新**：保留“刷新关卡列表”，只更新有变化的目录；正在切图或关卡内不刷新。刷新过程中禁止选关。
 - **异步请求**：15 秒未完成时记录等待提示，继续等待同一个请求；仅在请求已经完成且失败后同步重试，避免无法取消的旧请求与新请求争抢同一个包。
 
@@ -96,7 +104,9 @@ dotnet build -c Release -p:GameDir="D:\Games\Steam Games\steamapps\common\Overco
 
 ## 验证
 
-1.6.16 已通过 Release 构建、157 项缓存管理器断言、39 项旧 Mono 兼容断言及 25 项格式迁移／持久拒绝断言。已核对本机 UnityPlayer 的 13 处机器码，确认流式位选择另一组 codec 接口，而 LZ4 的流式接口恒定返回失败。对真实 DMM，新旧缓存恰有 1,231 个标记字节变化，其余文件字节不变；解压资源哈希与原件一致。游戏 Mono 冷构建及重新初始化后的校验复用均通过，另保留编码边界／布局／损坏／取消检查。结果位于 `../.verification/cache-1.6.16/`。尚未在游戏内执行修复后的完整 AssetBundle 加载或测量提速，需以实际 `LZ4 cache` 命中日志和分阶段耗时为准。
+1.6.17 已通过 Release 构建、61 项生产选档代码隔离断言、96 项实际托管类型的前端断言及 32 个安装程序集的 Harmony 包装签名检查。缓存管理器通过 51 项全地图策略断言、157 项既有断言、36 项旧 Mono 兼容断言及 25 项格式／拒绝断言。使用游戏自带 x86 Mono 对真实 20 包冷构建及重新初始化复用均通过；独立解码核对完整数据 SHA-256 和 CAB／节点目录一致。最终管理器另验证 Queue 校验不刷新 20 个缓存的使用时间、随后全部命中且零次重新转码。记录位于 `../.verification/cache-1.6.17/` 和 `../.verification/save-ui-1.6.17/`。这些测试未启动游戏，选档原生显示效果与双方联机仍需实机回归；没有替换已安装 DLL。
+
+1.6.16 已通过 Release 构建、157 项缓存管理器断言、39 项旧 Mono 兼容断言及 25 项格式迁移／持久拒绝断言。已核对本机 UnityPlayer 的 13 处机器码，确认流式位选择另一组 codec 接口，而 LZ4 的流式接口恒定返回失败。对真实 DMM，新旧缓存恰有 1,231 个标记字节变化，其余文件字节不变；解压资源哈希与原件一致。游戏 Mono 冷构建及重新初始化后的校验复用均通过，另保留编码边界／布局／损坏／取消检查。结果位于 `../.verification/cache-1.6.16/`。用户已反馈 1.6.16 实机提速显著；此处隔离检查本身未执行 Unity 原生加载，也未测量游戏耗时。
 
 1.6.15 已通过 Release 构建、39 项旧 Mono 文件异常兼容断言、原缓存管理器 156 项断言及既有兼容检查（含 31 个 Harmony 签名）。另用独立 x86 宿主加载游戏自带 `mono.dll` 和 `mscorlib`（运行时 2.0.50727.1433），旧管理器精确复现缺少 `.bad` 的失败；修复后的生产缓存／转码源码成功从空目录转换真实 DMM，生成 110,259,016 字节缓存（该次独立转换 26,007 毫秒），重新初始化后校验文件并命中缓存，无须再次转换。结果在 `../.verification/cache-1.6.15/`。这验证实际 Mono 文件和转码流程，没有启动游戏或执行 Unity 原生 AssetBundle 加载；转换耗时不是进图耗时。
 
@@ -122,7 +132,7 @@ dotnet build -c Release -p:GameDir="D:\Games\Steam Games\steamapps\common\Overco
 - `async level preparation started`、`async level resources ready`、`on-demand config ready (... async level entry ...)`：单机／房主异步准备；总耗时包含异步等待，单套配置耗时超过或等于 50 毫秒时还会输出 Info 计时。
 - `DIY client level message deferred/resumed`、`async client level preparation started`、`client level bundle ready`、`client level info asset ready`：客机异步准备及一次恢复；`DIY client level preparation cancelled`：旧连接或旧目标失效。
 - `duplicate DIY ... ignored`：重复选关、选档或存档确认被拦截。
-- `DIY save dialog opened/closed`、`DIY save choice confirmed`、`DIY server save acknowledgement received`、`DIY server/client save UI closed`：选档弹出、关闭、确认、房主收到回执，以及加载前界面清理。房主回执列出各机器／槽位的游戏状态，不记录账号 ID。`DIY client loading acknowledged before resources`、`DIY client state sent`：开始加载的衔接；`DIY client disconnect path`：客机开始加载后两分钟内的断线调用路径，只记录，不改变断线处理。`Qichi runtime request startup`：七池原生异步等待之前，同步启动请求（含运行库读文件／解码）的耗时。
+- `DIY save dialog opened/closed`、`DIY save choice confirmed`、`DIY server save acknowledgement received`、`DIY server/client save UI retained with input locked during resource preparation`：选档弹出、关闭、确认、房主收到回执，以及加载前界面保留／输入锁定。房主回执列出各机器／槽位的游戏状态，不记录账号 ID。`DIY client loading acknowledged before resources`、`DIY client state sent`：开始加载的衔接；`DIY client disconnect path`：客机开始加载后两分钟内的断线调用路径，只记录，不改变断线处理。`Qichi runtime request startup`：七池原生异步等待之前，同步启动请求（含运行库读文件／解码）的耗时。
 - `level loading priority`、`level loading priority released`：临时提高与释放加载优先级；`level bundle ready`、`level info asset ready`：分阶段计时。优先级释放日志还会记录交给原始切图流程后的耗时。
 - `scene material audit`、`scene material invalid`：进入 DIY 场景后对材质 Shader 引用与支持状态做一次只读检查；不会自动替换材质。
 

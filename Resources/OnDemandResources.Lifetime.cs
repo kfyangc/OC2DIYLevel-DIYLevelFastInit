@@ -66,6 +66,7 @@ namespace DIYLevelFastInit
             {
                 _pendingScene = null;
                 CancelPreview();
+                EndSaveSelectionView(CaptureSaveSelectionView(), false);
                 SaveSelection.Reset();
                 _visibleSaveDialog = null;
             }

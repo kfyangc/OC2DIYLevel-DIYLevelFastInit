@@ -81,6 +81,7 @@ namespace DIYLevelFastInit
         private static long _serverPreparationGeneration;
         private static readonly Dictionary<string, BundleFileCache.Lease> InfoBundleLeases = new Dictionary<string, BundleFileCache.Lease>(StringComparer.OrdinalIgnoreCase);
         private static readonly Dictionary<string, AssetBundleRequest> PendingLevelInfos = new Dictionary<string, AssetBundleRequest>(StringComparer.OrdinalIgnoreCase);
+        private static SaveSelectionView _saveSelectionView;
 
         internal static bool IsTransitioning { get { return _pendingScene != null; } }
         internal static bool IsClientTransition { get { return IsTransitioning && !ConnectionStatusPublicizer.IsHost() && ConnectionStatusPublicizer.IsInSession(); } }
@@ -109,7 +110,11 @@ namespace DIYLevelFastInit
             Patch(harmony, typeof(DIYLevelEntryUI), "OnLevelSelected", nameof(SelectionPrefix), null);
             Patch(harmony, typeof(SelectSaveDialog), "Show", nameof(SaveDialogShowPrefix), nameof(SaveDialogShowPostfix));
             Patch(harmony, typeof(SelectSaveDialog), "Hide", nameof(SaveDialogHidePrefix), nameof(SaveDialogHidePostfix));
-            Patch(harmony, typeof(SelectSaveDialog), "OnDontSaveSelected", null, nameof(DontSavePostfix));
+            Patch(harmony, typeof(SelectSaveDialog), "ForceClose", nameof(SaveDialogForceClosePrefix), null);
+            harmony.Patch(AccessTools.Method(typeof(SelectSaveDialog), "OnDontSaveSelected"),
+                prefix: new HarmonyMethod(typeof(OnDemandResources), nameof(DontSavePrefix)),
+                postfix: new HarmonyMethod(typeof(OnDemandResources), nameof(DontSavePostfix)),
+                finalizer: new HarmonyMethod(typeof(OnDemandResources), nameof(DontSaveFinalizer)));
             Patch(harmony, typeof(T17FrontendFlow), "ShowClientSaveDialog", nameof(ClientSaveDialogPrefix), null);
             Patch(harmony, typeof(T17FrontendFlow), "StartClientCountdown", nameof(ClientCountdownPrefix), null);
             Patch(harmony, typeof(ServerUserSystem), "OnClientGameStateChanged", null, nameof(ServerSaveStatePostfix));

@@ -52,7 +52,7 @@ namespace DIYLevelFastInit
         {
             internal string Source, Key, Bundle, Metadata, LockFile, BadFile;
             internal long SourceLength, SourceTicks, OutputLength, OutputTicks, LastUse;
-            internal bool Queued, Ready, Rejected, WriteBad, Touch;
+            internal bool Queued, Ready, Rejected, WriteBad, Touch, Skipped;
             internal int Pins;
         }
 
@@ -61,6 +61,7 @@ namespace DIYLevelFastInit
             internal readonly object Sync = new object();
             internal readonly Dictionary<string, Entry> Entries = new Dictionary<string, Entry>(StringComparer.OrdinalIgnoreCase);
             internal readonly Queue<Entry> Jobs = new Queue<Entry>();
+            internal readonly Queue<Entry> Builds = new Queue<Entry>();
             internal readonly Queue<string> Logs = new Queue<string>();
             internal string Root;
             internal Action<string> Log;
@@ -88,25 +89,32 @@ namespace DIYLevelFastInit
         private const int Schema = 1;
         internal const int FormatVersion = 2;
         private const int BadMagic = 0x31424342;
-        private const long MaxBytes = 512L * 1024 * 1024;
+        internal const long DefaultBudget = 2L * 1024 * 1024 * 1024;
+        internal const long MaximumBudget = 16L * 1024 * 1024 * 1024;
+        private const long MaxOutputBytes = 2L * 1024 * 1024 * 1024 - 1;
         private static readonly object Configuration = new object();
         private static State _state;
 
         internal static void Configure(string root, Action<string> log)
         {
-            Configure(root, log, UnityFsRepacker.Convert);
+            Configure(root, log, UnityFsRepacker.Convert, DefaultBudget);
+        }
+
+        internal static void Configure(string root, Action<string> log, long budget)
+        {
+            Configure(root, log, UnityFsRepacker.Convert, budget);
         }
 
         internal static void Configure(string root, Action<string> log, Converter convert)
         {
-            Configure(root, log, convert, MaxBytes);
+            Configure(root, log, convert, DefaultBudget);
         }
 
         internal static void Configure(string root, Action<string> log, Converter convert, long budget)
         {
             if (root == null || convert == null) throw new ArgumentNullException();
             State next = new State { Root = System.IO.Path.GetFullPath(root), Log = log, Convert = convert,
-                Budget = Math.Min(MaxBytes, Math.Max(1, budget)), Maintenance = true };
+                Budget = Math.Min(MaximumBudget, Math.Max(1, budget)), Maintenance = true };
             next.Worker = new Thread(() => Work(next)) { IsBackground = true, Name = "DIY bundle file cache", Priority = ThreadPriority.BelowNormal };
             lock (Configuration)
             {
@@ -117,6 +125,11 @@ namespace DIYLevelFastInit
         }
 
         internal static Lease Acquire(string source)
+        {
+            return Request(source, true);
+        }
+
+        private static Lease Request(string source, bool demand)
         {
             State state;
             lock (Configuration) state = _state;
@@ -143,6 +156,7 @@ namespace DIYLevelFastInit
                         FileInfo file = new FileInfo(entry.Bundle);
                         if (file.Exists && file.Length == entry.OutputLength && file.LastWriteTimeUtc.Ticks == entry.OutputTicks)
                         {
+                            if (!demand) return new Lease(source);
                             FileStream pin = new FileStream(entry.Bundle, FileMode.Open, FileAccess.Read, FileShare.Read);
                             entry.Pins++;
                             entry.LastUse = DateTime.UtcNow.Ticks;
@@ -156,7 +170,7 @@ namespace DIYLevelFastInit
                     catch (UnauthorizedAccessException) { }
                     entry.Ready = false;
                 }
-                if (!entry.Rejected && !entry.Queued && !state.Cancelled)
+                if (!entry.Rejected && !entry.Skipped && !entry.Queued && !state.Cancelled)
                 {
                     entry.Queued = true;
                     state.Jobs.Enqueue(entry);
@@ -166,7 +180,7 @@ namespace DIYLevelFastInit
             return new Lease(source);
         }
 
-        internal static void Queue(string source) { using (Acquire(source)) { } }
+        internal static void Queue(string source) { using (Request(source, false)) { } }
 
         internal static void Reject(string original, string cached)
         {
@@ -223,7 +237,7 @@ namespace DIYLevelFastInit
 
         private static bool Allowed(string source)
         {
-            try { return source != null && string.Equals(System.IO.Path.GetFileName(source), "info_dmm", StringComparison.OrdinalIgnoreCase); }
+            try { return source != null && System.IO.Path.GetFileName(source).StartsWith("info", StringComparison.OrdinalIgnoreCase); }
             catch (ArgumentException) { return false; }
         }
 
@@ -267,13 +281,14 @@ namespace DIYLevelFastInit
                 while (true)
                 {
                     Entry entry = null;
-                    bool idle;
+                    bool idle, validateOnly = false, build = false;
                     lock (state.Sync)
                     {
-                        while (!state.Cancelled && !state.RejectionsPending && (!state.Idle || (state.Jobs.Count == 0 && !state.Maintenance))) Monitor.Wait(state.Sync);
+                        while (!state.Cancelled && !state.RejectionsPending && (!state.Idle || (state.Jobs.Count == 0 && state.Builds.Count == 0 && !state.Maintenance))) Monitor.Wait(state.Sync);
                         if (state.Cancelled) return;
                         idle = state.Idle;
-                        if (idle && state.Jobs.Count != 0) entry = state.Jobs.Dequeue();
+                        if (idle && state.Jobs.Count != 0) { entry = state.Jobs.Dequeue(); validateOnly = true; }
+                        else if (idle && state.Builds.Count != 0) entry = state.Builds.Dequeue();
                         if (idle) state.Maintenance = false;
                         state.RejectionsPending = false;
                     }
@@ -282,12 +297,23 @@ namespace DIYLevelFastInit
                         Directory.CreateDirectory(state.Root);
                         FlushRejections(state);
                         if (!idle) continue;
-                        if (entry != null) Prepare(state, entry);
+                        if (entry != null) build = Prepare(state, entry, validateOnly);
                         Maintain(state);
                     }
                     catch (OperationCanceledException) { return; }
                     catch (Exception error) { Log(state, "bundle file cache worker: " + error); }
-                    finally { if (entry != null) lock (state.Sync) entry.Queued = false; }
+                    finally
+                    {
+                        if (entry != null) lock (state.Sync)
+                        {
+                            if (build && !state.Cancelled && !entry.Rejected && !entry.Skipped)
+                            {
+                                state.Builds.Enqueue(entry);
+                                Monitor.PulseAll(state.Sync);
+                            }
+                            else entry.Queued = false;
+                        }
+                    }
                 }
             }
             finally
@@ -305,32 +331,38 @@ namespace DIYLevelFastInit
             catch (UnauthorizedAccessException) { return null; }
         }
 
-        private static void Prepare(State state, Entry entry)
+        private static bool Prepare(State state, Entry entry, bool validateOnly)
         {
             Checkpoint(state);
-            lock (state.Sync) if (entry.Rejected) return;
+            lock (state.Sync) if (entry.Rejected || entry.Skipped) return false;
             using (FileStream fileLock = TryLock(entry.LockFile))
             {
-                if (fileLock == null) return;
-                if (!MatchesSource(entry)) return;
+                if (fileLock == null) return false;
+                if (!MatchesSource(entry)) return false;
                 if (IsBad(entry))
                 {
                     lock (state.Sync) entry.Rejected = true;
                     Log(state, "bundle file cache disabled after previous Unity load failure: " + entry.Source
                         + " (format " + FormatVersion + "; using source)");
-                    return;
+                    return false;
                 }
                 Metadata metadata = ReadMetadata(entry);
                 if (metadata != null && Validate(state, entry, metadata))
                 {
-                    MarkReady(state, entry, metadata.OutputLength);
+                    MarkReady(state, entry, metadata.OutputLength, false);
                     Log(state, "bundle file cache validated: " + entry.Source);
-                    return;
+                    return false;
                 }
-                lock (state.Sync) if (entry.Rejected || entry.Pins != 0) return;
-                if (!Delete(entry.Metadata) || !Delete(entry.Bundle)) return;
+                lock (state.Sync) if (entry.Rejected || entry.Pins != 0) return false;
+                if (validateOnly) return true;
+                if (!Delete(entry.Metadata) || !Delete(entry.Bundle)) return false;
                 Checkpoint(state);
-                if (!UnityFsRepacker.IsEligible(entry.Source)) return;
+                if (!UnityFsRepacker.IsEligible(entry.Source))
+                {
+                    lock (state.Sync) entry.Skipped = true;
+                    Log(state, "bundle file cache source not eligible; using original until it changes: " + entry.Source);
+                    return false;
+                }
                 string temporary = System.IO.Path.Combine(state.Root, entry.Key + "." + Guid.NewGuid().ToString("N") + ".tmp");
                 string metadataTemporary = temporary + ".meta";
                 try
@@ -338,7 +370,7 @@ namespace DIYLevelFastInit
                     System.Diagnostics.Stopwatch timer = System.Diagnostics.Stopwatch.StartNew();
                     UnityFsRepacker.ConversionResult result = state.Convert(entry.Source, temporary, () => state.Cancelled, () => Checkpoint(state));
                     Checkpoint(state);
-                    lock (state.Sync) if (entry.Rejected) return;
+                    lock (state.Sync) if (entry.Rejected) return false;
                     if (!MatchesSource(entry) || !ValidResult(result, entry) || new FileInfo(temporary).Length != result.OutputLength
                         || !Same(HashFile(state, temporary), result.OutputHash) || !Same(HashFile(state, entry.Source), result.SourceHash)
                         || !MatchesSource(entry)) throw new IOException("Converted bundle validation failed");
@@ -348,19 +380,20 @@ namespace DIYLevelFastInit
                     if (!Prune(state, result.OutputLength + new FileInfo(metadataTemporary).Length))
                     {
                         Log(state, "bundle file cache capacity pinned; source retained: " + entry.Source);
-                        return;
+                        return false;
                     }
                     Checkpoint(state);
-                    lock (state.Sync) if (entry.Rejected) return;
-                    if (!MatchesSource(entry)) return;
+                    lock (state.Sync) if (entry.Rejected) return false;
+                    if (!MatchesSource(entry)) return false;
                     File.Move(temporary, entry.Bundle);
                     File.Move(metadataTemporary, entry.Metadata);
-                    MarkReady(state, entry, result.OutputLength);
+                    MarkReady(state, entry, result.OutputLength, true);
                     Log(state, "bundle file cache built: " + entry.Source + " (" + result.SourceLength + " -> " + result.OutputLength
                         + " bytes, " + timer.ElapsedMilliseconds + " ms)");
                 }
                 finally { Delete(temporary); Delete(metadataTemporary); }
             }
+            return false;
         }
 
         private static bool MatchesSource(Entry entry)
@@ -373,7 +406,7 @@ namespace DIYLevelFastInit
 
         private static bool ValidResult(UnityFsRepacker.ConversionResult result, Entry entry)
         {
-            return result != null && result.SourceLength == entry.SourceLength && result.OutputLength > 0 && result.OutputLength <= MaxBytes
+            return result != null && result.SourceLength == entry.SourceLength && result.OutputLength > 0 && result.OutputLength <= MaxOutputBytes
                 && result.DataLength > 0 && result.BlockCount > 0 && result.SourceHash != null && result.SourceHash.Length == 32
                 && result.OutputHash != null && result.OutputHash.Length == 32 && result.DataHash != null && result.DataHash.Length == 32;
         }
@@ -414,7 +447,7 @@ namespace DIYLevelFastInit
                     || reader.ReadInt64() != entry.SourceLength || reader.ReadInt64() != entry.SourceTicks) return null;
                 Metadata result = new Metadata { OutputLength = reader.ReadInt64(), DataLength = reader.ReadInt64(), BlockCount = reader.ReadInt32(),
                     SourceHash = reader.ReadBytes(32), DataHash = reader.ReadBytes(32), OutputHash = reader.ReadBytes(32) };
-                if (result.OutputLength <= 0 || result.OutputLength > MaxBytes || result.DataLength <= 0 || result.BlockCount <= 0
+                if (result.OutputLength <= 0 || result.OutputLength > MaxOutputBytes || result.DataLength <= 0 || result.BlockCount <= 0
                     || result.SourceHash.Length != 32 || result.DataHash.Length != 32 || result.OutputHash.Length != 32 || stream.Position != stream.Length) return null;
                 return result;
             }
@@ -452,16 +485,18 @@ namespace DIYLevelFastInit
             }
         }
 
-        private static void MarkReady(State state, Entry entry, long length)
+        private static void MarkReady(State state, Entry entry, long length, bool built)
         {
             FileInfo file = new FileInfo(entry.Bundle);
+            long lastUse = built ? DateTime.UtcNow.Ticks : File.GetLastWriteTimeUtc(entry.Metadata).Ticks;
             lock (state.Sync)
             {
                 if (entry.Rejected || state.Cancelled) return;
                 entry.OutputLength = length;
                 entry.OutputTicks = file.LastWriteTimeUtc.Ticks;
-                entry.LastUse = DateTime.UtcNow.Ticks;
-                entry.Ready = entry.Touch = true;
+                entry.LastUse = Math.Max(entry.LastUse, lastUse);
+                entry.Ready = true;
+                if (built) entry.Touch = true;
                 state.Maintenance = true;
             }
         }

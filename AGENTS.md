@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.16 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.17 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -144,11 +144,16 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   factories between server and gated client entry. Keep `_directoryBuild` scoped to each
   synchronous factory. A complex individual config or scene activation may still spike.
 - On both server/single-player and remote DIY entry, stop the frontend client save
-  countdown, clear pending DIY save payloads and hide the save-wait overlay before
-  closing save dialogs through `Hide(false)`. Yield while a dialog refuses to hide;
-  keep its write/load routine running and check the entry identity between frames.
-  Close the host UI after the initial yield, outside its save-ready callback stack.
-  Never restore the dialog's invoker while entering. Prevent countdown restart and
+  countdown, clear pending DIY save payloads and hide only the save-wait overlay.
+  Retain the save dialog from confirmation through scene arrival, locking input with
+  owned Team17 event-system suppressors before the original callback can hide it.
+  Wait for `CanHide()` without calling `Hide(false)` or `CleanUp`; keep the dialog and
+  its save-slot Update running. Don't Save may skip only its own synchronous ForceClose;
+  real disconnect/invite closes must still run. Release only owned suppressors on
+  scene arrival, cancellation, failure, official selection and shutdown. Failed old
+  requests must not restore or unlock a newer selection. Pass the held view directly
+  to preparation owners before the first yield; never reacquire it from global state
+  after waiting. Prevent countdown restart and
   stale `LoadedCampaignMapSave` sends during the transition. Announce only the message's
   start-loading state before native waits; suppress its duplicate during the scoped
   replay. Never announce `LoadedKitchen` early: the original scene readiness path owns it.
@@ -307,14 +312,18 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
 
 - `BundleFileCache` is pure managed code. Its single low-priority worker must not call
   Unity/BepInEx APIs; `Tick` gates idle work and forwards queued diagnostics on the main thread.
-- Only supported single-block LZMA `info_dmm` sources are eligible. Keep all original
+- Compatible single-block LZMA `info*` sources are eligible. Remember unsupported
+  layouts for that fingerprint in the current process. Keep all original
   path keys, CAB names, dependencies and source files intact. Cache misses must return
   the original path without waiting for conversion or whole-file hash validation.
 - Cache files are leased through both native request completion and loaded container
   lifetime. Release the lease after `Unload(false)`, never when an async wait is cancelled.
   Retry original input only after the cached native request completes or fails to start.
 - Validate source/output hashes off-thread, publish metadata last, retain fingerprinted
-  rejection markers, and respect the 512 MiB published-data budget. Interrupted temporary
+  rejection markers, and respect the configurable published-data budget (2 GiB default,
+  128–16384 MiB). Validate queued existing entries before starting new conversions;
+  background Queue/validation must not refresh existing LRU times or pin files.
+  Keep the per-output parser bound separate from the aggregate budget. Interrupted temporary
   files may be removed only while holding the matching cross-process lock.
 - `UnityFsRepacker` streams 128 KiB blocks using the original bounded LZMA dictionary;
   never reuse the graph reader's prefix-only decoder clamp or retain the entire payload.
