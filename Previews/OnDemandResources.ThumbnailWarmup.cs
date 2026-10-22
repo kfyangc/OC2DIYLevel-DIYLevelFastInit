@@ -83,7 +83,28 @@ namespace DIYLevelFastInit
 
         private static IEnumerator WarmThumbnailSet(string path, List<LevelInfoSO> missing, int generation, Box<bool> interrupted)
         {
-            Box<LevelSetInfoSO> info = new Box<LevelSetInfoSO>();
+            int next = 0;
+            while (next < missing.Count)
+            {
+                if (WarmupPaused() || generation != _warmGeneration) { interrupted.Value = true; yield break; }
+                Box<int> completed = new Box<int> { Value = next };
+                yield return WarmThumbnailBatch(path, missing, next, generation, completed, interrupted);
+                next = completed.Value;
+                yield return WaitForCleanup();
+                if (interrupted.Value) yield break;
+            }
+            while (ThumbnailCache.WritesBusy)
+            {
+                if (WarmupPaused() || generation != _warmGeneration) { interrupted.Value = true; yield break; }
+                yield return null;
+            }
+        }
+
+        private static IEnumerator WarmThumbnailBatch(string path, List<LevelInfoSO> missing, int first, int generation,
+            Box<int> completed, Box<bool> interrupted)
+        {
+            Box<LevelInfoSO> info = new Box<LevelInfoSO>();
+            LoadedSet set = null;
             _warmLoading = true;
             try
             {
@@ -96,26 +117,29 @@ namespace DIYLevelFastInit
                     yield return EnsureInfoBundleAsync(required, -10);
                 }
                 if (WarmupPaused() || generation != _warmGeneration) { interrupted.Value = true; yield break; }
-                yield return EnsureInfoAssetAsync(path, InfoBundles[files[0].FullName], info, -10);
-                foreach (LevelInfoSO catalogLevel in missing)
+                Func<bool> current = () => !WarmupPaused() && generation == _warmGeneration;
+                for (int i = first; i < missing.Count; i++)
                 {
+                    LevelInfoSO catalogLevel = missing[i];
                     while (!ThumbnailCache.HasWriteCapacity && !WarmupPaused() && generation == _warmGeneration) yield return null;
                     if (WarmupPaused() || generation != _warmGeneration) { interrupted.Value = true; yield break; }
+                    completed.Value = i + 1;
                     if (ThumbnailCache.IsReady(path, catalogLevel.sceneName)) continue;
-                    foreach (LevelInfoSO level in info.Value.levelInfos)
-                        if (string.Equals(level.sceneName, catalogLevel.sceneName, StringComparison.OrdinalIgnoreCase))
-                        {
-                            try { ThumbnailCache.Capture(path, catalogLevel.sceneName, level.screenshot, false); }
-                            catch (Exception e) { FastInitPlugin.Log.LogWarning("thumbnail prewarm skipped [" + catalogLevel.sceneName + "]: " + e.Message); }
-                            break;
-                        }
+                    yield return EnsureLevelInfoAsync(path, catalogLevel.sceneName, info, -10, current);
+                    if (!current()) { interrupted.Value = true; yield break; }
+                    if (info.Value == null) throw new IOException("Level no longer in thumbnail info: " + catalogLevel.sceneName);
+                    try { ThumbnailCache.Capture(path, catalogLevel.sceneName, info.Value.screenshot, false); }
+                    catch (Exception e) { FastInitPlugin.Log.LogWarning("thumbnail prewarm skipped [" + catalogLevel.sceneName + "]: " + e.Message); }
+                    info.Value = null;
                     yield return null;
+                    if (!Sets.TryGetValue(path, out set) || set.Info == null) yield break;
                 }
-                while (ThumbnailCache.WritesBusy) yield return null;
+                while (ThumbnailCache.WritesBusy && current()) yield return null;
             }
             finally
             {
                 info.Value = null;
+                set = null;
                 _warmLoading = false;
                 _warmBundles = null;
                 ReleaseUnused();

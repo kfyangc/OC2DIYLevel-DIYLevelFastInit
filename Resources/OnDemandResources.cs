@@ -21,6 +21,10 @@ namespace DIYLevelFastInit
             internal LevelSetInfoSO Info;
             internal readonly HashSet<string> Required = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             internal readonly Dictionary<string, HashSet<string>> SceneDependencies = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+            internal readonly Dictionary<string, LevelInfoSO> LoadedLevels = new Dictionary<string, LevelInfoSO>(StringComparer.OrdinalIgnoreCase);
+            internal LevelAssetIndex AssetIndex;
+            internal bool AssetNamesRead;
+            internal readonly HashSet<string> InvalidAssets = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         }
 
         private sealed class LevelResources
@@ -76,6 +80,7 @@ namespace DIYLevelFastInit
         private static bool _cleanupQueued, _cleanupRequested;
         private static long _serverPreparationGeneration;
         private static readonly Dictionary<string, BundleFileCache.Lease> InfoBundleLeases = new Dictionary<string, BundleFileCache.Lease>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, AssetBundleRequest> PendingLevelInfos = new Dictionary<string, AssetBundleRequest>(StringComparer.OrdinalIgnoreCase);
 
         internal static bool IsTransitioning { get { return _pendingScene != null; } }
         internal static bool IsClientTransition { get { return IsTransitioning && !ConnectionStatusPublicizer.IsHost() && ConnectionStatusPublicizer.IsInSession(); } }
@@ -84,10 +89,12 @@ namespace DIYLevelFastInit
         {
             get
             {
-                return !FastInitPlugin.Loading && !FastInitPlugin.Syncing && !IsTransitioning
+                string activeScene = SceneManager.GetActiveScene().name;
+                return (activeScene == "StartScreen" || activeScene == "Lobbies") && !LoadingScreenFlow.IsLoading
+                    && !FastInitPlugin.Loading && !FastInitPlugin.Syncing && !IsTransitioning
                     && !PseudoPrefabManager.isInCustomLevel && !_serverPreparing
                     && _catalogBundles == null && _previewBundles == null && _warmBundles == null
-                    && PendingBundles.Count == 0 && PendingInfos.Count == 0
+                    && PendingBundles.Count == 0 && PendingInfos.Count == 0 && PendingLevelInfos.Count == 0
                     && Time.realtimeSinceStartup - _lastPreviewTime >= 0.5f;
             }
         }

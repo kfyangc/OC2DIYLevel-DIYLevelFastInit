@@ -169,7 +169,7 @@ namespace DIYLevelFastInit
         {
             LoadedSet loaded;
             bool exists = Sets.TryGetValue(path, out loaded);
-            if (exists && (scene == null || loaded.SceneDependencies.ContainsKey(scene))) return loaded;
+            if (exists && scene != null && loaded.SceneDependencies.ContainsKey(scene) && loaded.LoadedLevels.ContainsKey(scene)) return loaded;
             List<FileInfo> files = FastInitHost.SafeGetFiles(new DirectoryInfo(path), "info*");
             if (files.Count == 0) throw new FileNotFoundException("Missing info bundle", path);
             HashSet<string> required = InfoBundleGraph.Required(files[0].FullName,
@@ -178,21 +178,15 @@ namespace DIYLevelFastInit
             {
                 foreach (string dependency in required)
                     GetInfoBundle(dependency);
-                if (Sets.TryGetValue(path, out loaded))
+                AssetBundle bundle = InfoBundles[files[0].FullName];
+                loaded = GetLoadedSet(path, bundle, files[0].FullName);
+                if (scene != null)
                 {
                     loaded.SceneDependencies[scene] = required;
-                    return loaded;
+                    ResolveLevelSynchronously(path, scene, loaded);
                 }
-                AssetBundle bundle = InfoBundles[files[0].FullName];
-                AssetBundleRequest pending;
-                LevelSetInfoSO info = PendingInfos.TryGetValue(path, out pending)
-                    ? pending.asset as LevelSetInfoSO : bundle.LoadAsset<LevelSetInfoSO>("LevelSetInfo");
-                if (info == null) throw new IOException("Missing LevelSetInfo: " + path);
-                loaded = new LoadedSet { Bundle = bundle, Info = info };
-                loaded.Required.UnionWith(scene == null ? required : InfoBundleGraph.Required(files[0].FullName, null));
-                if (scene != null) loaded.SceneDependencies[scene] = required;
-                Sets.Add(path, loaded);
-                FastInitPlugin.Log.LogInfo("on-demand info loaded: " + Path.GetFileName(path) + " (" + InfoBundles.Count + " bundles tracked)");
+                else if (loaded.Info == null)
+                    loaded.Info = ReadFullInfoSynchronously(path, bundle);
                 return loaded;
             }
             catch
@@ -204,9 +198,8 @@ namespace DIYLevelFastInit
 
         private static LevelInfoSO Resolve(string path, string scene)
         {
-            foreach (LevelInfoSO info in LoadSet(path).Info.levelInfos)
-                if (string.Equals(info.sceneName, scene, StringComparison.OrdinalIgnoreCase)) return info;
-            throw new IOException("Level no longer in info bundle; refresh the catalog: " + scene);
+            LoadedSet loaded = LoadSet(path, scene);
+            return loaded.LoadedLevels[scene];
         }
     }
 }

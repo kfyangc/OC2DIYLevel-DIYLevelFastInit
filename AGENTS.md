@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.13 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.14 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -194,13 +194,14 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   drained and released rather than cancelled or allowed to overwrite a newer image.
   Drain queued unused-asset collection before starting the next preview, so sustained
   browsing cannot accumulate detached asset graphs behind an always-busy worker.
-  `PendingInfos` lets actual level entry join the same native info request. Refresh
+  `PendingLevelInfos` shares the same native request for a selected asset;
+  `PendingInfos` retains the separate full-set fallback request. Refresh
   cancels the preview selection and waits for its worker to drain before mutating sets.
 - With the optional thumbnail adapter installed, `FinishLoading` queues sequential
   thumbnail prewarming over the complete catalog, without requiring menu visits.
-  Pin `_warmBundles` while native requests run; keep full `LevelSetInfo` only in the
-  current worker, write one copied image per frame, drain the bounded disk writer,
-  release source references and wait for unused-asset collection before the next set.
+  Pin `_warmBundles` while native requests run. Load selected LevelInfo assets, copy
+  one image per frame, and release/wait for cleanup between direct levels. If full-set
+  fallback is needed, reuse that graph for the remaining batch before releasing it.
   Pause for gameplay, transitions and uncached foreground previews. Refresh invalidates
   the warmup generation and waits for native requests to drain before changing entries.
   Cached foreground images bypass the warmup wait and cleanup queue.
@@ -279,6 +280,21 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   contract with the compiled OC2DIYLevel 0.10.0 — if that plugin updates, re-verify against
   its decompiled source at `C:\Users\yang\.cache\OC2DIYLevel-decompiled\OC2DIYLevel_src\`.
 
+## Selected level assets
+
+- `LoadedSet.Info` is optional and holds only the full-set compatibility fallback;
+  `LoadedLevels` stores selected native LevelInfo assets by scene. Public catalog SOs
+  remain lightweight and stable. Cold scalar-catalog discovery still reads full info.
+- Resolve metadata SO names through `LevelAssetIndex` with unique case-insensitive
+  basenames. Validate loaded type/name/scene; unknown, ambiguous and failed addresses
+  fall back only after native completion and while that consumer is still current.
+- `PendingLevelInfos` uses set-path plus asset-address keys, separate from full-set
+  `PendingInfos`. Synchronous consumers must join a pending native asset request and
+  must never issue a competing request/fallback while it remains incomplete.
+- `ReleaseUnused` drops per-level references for departed scenes and retains the exact
+  uncached preview scene. Keep container/CAB dependencies and cache-file leases until
+  their last active, pending, preview or warmup owner has finished.
+
 ## Disposable bundle cache
 
 - `BundleFileCache` is pure managed code. Its single low-priority worker must not call
@@ -303,10 +319,11 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
 - Plugin dir must be resolved from `typeof(DIYLevelAssetBundleManager).Assembly.Location`,
   never `GetExecutingAssembly()` (would point at this plugin's own directory).
 - Keep `common*` bundles loaded before consuming `info_*` bundles (dependency resolution).
-- The smallest heavy-resource loading unit is one info bundle, plus any transitive
-  info dependencies of the selected scene/set, not one individual map. Common bundles
-  and other mods' retained assets remain outside this
-  plugin's cleanup scope. Preserve this distinction in memory claims.
+- Container loading includes one info bundle plus transitive dependencies of the
+  selected scene/set. Object loading requests a unique selected LevelInfo asset when
+  available, otherwise the full LevelSetInfo fallback. Do not equate this with splitting
+  the bundle file or removing selected-level dependencies. Common bundles and other
+  mods' retained assets remain outside this plugin's cleanup scope.
 
 ## Code style
 

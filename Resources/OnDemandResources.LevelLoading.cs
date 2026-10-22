@@ -204,29 +204,21 @@ namespace DIYLevelFastInit
                 FastInitPlugin.Log.LogInfo(context + "level bundle ready: " + Path.GetFileName(required) + " ("
                     + (resident ? "resident" : "async") + ", " + bundleTimer.ElapsedMilliseconds + " ms elapsed)");
             }
-            LoadedSet set;
-            if (!Sets.TryGetValue(path, out set))
+            Box<LevelInfoSO> info = new Box<LevelInfoSO>();
+            LevelInfoSO full;
+            try
             {
-                Box<LevelSetInfoSO> info = new Box<LevelSetInfoSO>();
-                try
-                {
-                    AssetBundle bundle = InfoBundles[files[0].FullName];
-                    System.Diagnostics.Stopwatch assetTimer = System.Diagnostics.Stopwatch.StartNew();
-                    yield return EnsureInfoAssetAsync(path, bundle, info, 10);
-                    if (!current()) yield break;
-                    FastInitPlugin.Log.LogInfo(context + "level info asset ready: " + scene + " (" + assetTimer.ElapsedMilliseconds + " ms elapsed)");
-                    set = new LoadedSet { Bundle = bundle, Info = info.Value };
-                    set.Required.UnionWith(InfoBundleGraph.Required(files[0].FullName, null));
-                    Sets.Add(path, set);
-                    FastInitPlugin.Log.LogInfo("on-demand info loaded: " + Path.GetFileName(path) + " ("
-                        + InfoBundles.Count + " bundles tracked, async " + context + "level entry)");
-                }
-                finally { info.Value = null; }
+                System.Diagnostics.Stopwatch assetTimer = System.Diagnostics.Stopwatch.StartNew();
+                yield return EnsureLevelInfoAsync(path, scene, info, 10, current);
+                if (!current()) yield break;
+                full = info.Value;
+                if (full == null) throw new IOException("Missing selected LevelInfo: " + scene);
+                FastInitPlugin.Log.LogInfo(context + "level info asset ready: " + scene + " (" + assetTimer.ElapsedMilliseconds + " ms elapsed)");
             }
-            set.SceneDependencies[scene] = requiredBundles;
+            finally { info.Value = null; }
+            Sets[path].SceneDependencies[scene] = requiredBundles;
             FastInitPlugin.Log.LogInfo("async " + context + "level resources ready: " + scene + " (" + timer.ElapsedMilliseconds + " ms elapsed)");
             LevelLoadProgress = context + "0/4";
-            LevelInfoSO full = Resolve(path, scene);
             SceneDirectoryData.SceneDirectoryEntry entry = PrepareSessionEntry(scene);
             entry.LoadScreenOverride = full.screenshot;
             for (int i = 0; i < entry.SceneVarients.Length; i++)

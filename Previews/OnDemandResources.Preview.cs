@@ -99,49 +99,25 @@ namespace DIYLevelFastInit
         private static IEnumerator LoadPreview(PreviewRequest request)
         {
             System.Diagnostics.Stopwatch timer = System.Diagnostics.Stopwatch.StartNew();
+            Box<LevelInfoSO> full = new Box<LevelInfoSO>();
             try
             {
                 if (TryShowCachedPreview(request)) yield break;
-                LoadedSet set;
-                if (!Sets.TryGetValue(request.Path, out set))
+                List<FileInfo> files = FastInitHost.SafeGetFiles(new DirectoryInfo(request.Path), "info*");
+                if (files.Count == 0) throw new FileNotFoundException("Missing info bundle", request.Path);
+                _previewBundles = InfoBundleGraph.Required(files[0].FullName, null);
+                ReleaseUnused();
+                foreach (string path in _previewBundles)
                 {
-                    List<FileInfo> files = FastInitHost.SafeGetFiles(new DirectoryInfo(request.Path), "info*");
-                    if (files.Count == 0) throw new FileNotFoundException("Missing info bundle", request.Path);
-                    _previewBundles = InfoBundleGraph.Required(files[0].FullName, null);
-                    ReleaseUnused();
-                    foreach (string path in _previewBundles)
-                    {
-                        if (!PreviewIsCurrent(request)) yield break;
-                        yield return EnsureInfoBundleAsync(path);
-                    }
                     if (!PreviewIsCurrent(request)) yield break;
-                    if (!Sets.TryGetValue(request.Path, out set))
-                    {
-                        AssetBundle bundle = InfoBundles[files[0].FullName];
-                        Box<LevelSetInfoSO> loadedInfo = new Box<LevelSetInfoSO>();
-                        try
-                        {
-                            yield return EnsureInfoAssetAsync(request.Path, bundle, loadedInfo, 0);
-                            if (!PreviewIsCurrent(request)) yield break;
-                            if (!Sets.TryGetValue(request.Path, out set))
-                            {
-                                set = new LoadedSet { Bundle = bundle, Info = loadedInfo.Value };
-                                set.Required.UnionWith(_previewBundles);
-                                Sets.Add(request.Path, set);
-                                FastInitPlugin.Log.LogInfo("on-demand preview info loaded: " + Path.GetFileName(request.Path)
-                                    + " (" + InfoBundles.Count + " bundles tracked)");
-                            }
-                        }
-                        finally { loadedInfo.Value = null; }
-                    }
+                    yield return EnsureInfoBundleAsync(path);
                 }
                 if (!PreviewIsCurrent(request)) yield break;
-                LevelInfoSO full = null;
-                foreach (LevelInfoSO level in set.Info.levelInfos)
-                    if (string.Equals(level.sceneName, request.Level.sceneName, StringComparison.OrdinalIgnoreCase)) { full = level; break; }
-                if (full == null) throw new IOException("Level no longer in preview info: " + request.Level.sceneName);
+                yield return EnsureLevelInfoAsync(request.Path, request.Level.sceneName, full, 0, () => PreviewIsCurrent(request));
+                if (!PreviewIsCurrent(request)) yield break;
+                if (full.Value == null) throw new IOException("Level no longer in preview info: " + request.Level.sceneName);
                 ThumbnailCache.Entry thumbnail = null;
-                try { thumbnail = ThumbnailCache.Capture(request.Path, request.Level.sceneName, full.screenshot); }
+                try { thumbnail = ThumbnailCache.Capture(request.Path, request.Level.sceneName, full.Value.screenshot); }
                 catch (Exception e) { FastInitPlugin.Log.LogWarning("thumbnail cache capture skipped: " + e.Message); }
                 if (thumbnail != null)
                 {
@@ -150,13 +126,14 @@ namespace DIYLevelFastInit
                 }
                 else
                 {
-                    request.Image.sprite = full.screenshot;
-                    request.Image.gameObject.SetActive(full.screenshot != null);
+                    request.Image.sprite = full.Value.screenshot;
+                    request.Image.gameObject.SetActive(full.Value.screenshot != null);
                 }
                 FastInitPlugin.Log.LogInfo("thumbnail ready: " + request.Level.sceneName + " (async, " + timer.ElapsedMilliseconds + " ms elapsed)");
             }
             finally
             {
+                full.Value = null;
                 _previewBundles = null;
                 ReleaseUnused();
             }

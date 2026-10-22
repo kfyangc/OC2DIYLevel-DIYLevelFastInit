@@ -20,7 +20,7 @@ namespace DIYLevelFastInit
     {
         public const string PluginGuid = "oc2.diylevel.fastinit";
         public const string PluginName = "DIYLevel FastInit";
-        public const string PluginVersion = "1.6.13";
+        public const string PluginVersion = "1.6.14";
 
         internal static ManualLogSource Log;
 
@@ -47,6 +47,7 @@ namespace DIYLevelFastInit
             new Dictionary<string, SetSnapshot>(StringComparer.OrdinalIgnoreCase);
 
         private static GUIStyle _progressStyle;
+        internal static bool UseIndividualLevelAssets = true;
 
         private void Awake()
         {

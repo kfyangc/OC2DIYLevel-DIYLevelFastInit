@@ -33,10 +33,25 @@ namespace DIYLevelFastInit
             return false;
         }
 
-        private static bool SetIsNeeded(LoadedSet set)
+        private static bool LevelIsNeeded(string path, string scene)
         {
-            foreach (LevelInfoSO level in set.Info.levelInfos)
-                if (SceneIsLoaded(level.sceneName) || string.Equals(_pendingScene, level.sceneName, StringComparison.OrdinalIgnoreCase)) return true;
+            return SceneIsLoaded(scene) || string.Equals(_pendingScene, scene, StringComparison.OrdinalIgnoreCase)
+                || (string.Equals(path, _previewPath, StringComparison.OrdinalIgnoreCase) && _previewRequest != null
+                    && _previewRequest.Level != null && string.Equals(_previewRequest.Level.sceneName, scene, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static bool SetIsNeeded(string path, LoadedSet set)
+        {
+            foreach (string scene in set.LoadedLevels.Keys)
+                if (LevelIsNeeded(path, scene)) return true;
+            foreach (KeyValuePair<string, AssetBundleRequest> pending in PendingLevelInfos)
+                if (pending.Key.StartsWith(path + "\n", StringComparison.OrdinalIgnoreCase) && !pending.Value.isDone) return true;
+            AssetBundleRequest infoRequest;
+            if (PendingInfos.TryGetValue(path, out infoRequest) && !infoRequest.isDone) return true;
+            foreach (KeyValuePair<string, LevelSetInfoSO> catalog in DIYLevelAssetBundleManager.levelSetInfos)
+                if (string.Equals(catalog.Key, path, StringComparison.OrdinalIgnoreCase))
+                    foreach (LevelInfoSO level in catalog.Value.levelInfos)
+                        if (SceneIsLoaded(level.sceneName) || string.Equals(_pendingScene, level.sceneName, StringComparison.OrdinalIgnoreCase)) return true;
             return false;
         }
 
@@ -119,12 +134,15 @@ namespace DIYLevelFastInit
             foreach (string path in new List<string>(Sets.Keys))
             {
                 LoadedSet set = Sets[path];
-                if (string.Equals(path, _previewPath, StringComparison.OrdinalIgnoreCase) || SetIsNeeded(set)) continue;
+                foreach (string scene in new List<string>(set.LoadedLevels.Keys))
+                    if (!LevelIsNeeded(path, scene)) set.LoadedLevels.Remove(scene);
+                if (string.Equals(path, _previewPath, StringComparison.OrdinalIgnoreCase) || SetIsNeeded(path, set)) continue;
                 foreach (KeyValuePair<string, LevelSetInfoSO> catalog in DIYLevelAssetBundleManager.levelSetInfos)
                     if (string.Equals(catalog.Key, path, StringComparison.OrdinalIgnoreCase))
                         foreach (LevelInfoSO level in catalog.Value.levelInfos) level.screenshot = null;
                 Sets.Remove(path);
                 set.Info = null;
+                set.LoadedLevels.Clear();
                 set.Bundle = null;
                 FastInitPlugin.Log.LogInfo("on-demand info released: " + Path.GetFileName(path));
             }
