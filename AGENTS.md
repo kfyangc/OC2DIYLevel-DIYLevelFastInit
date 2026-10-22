@@ -320,17 +320,29 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   start and wait for startup/catalog completion before BeginClientPreparation. Setting
   `_pendingScene` early would deadlock discovery's transition wait.
 - Every set's `.diylevel-fastinit` child directory holds the cross-process lock,
-  GUID temporary files and unique `original-<GUID>.bundle` / `.record` pairs. Never put
-  backup/temp files matching `info*` at the set root. Never overwrite an existing backup.
-  Record basenames only with bounded lengths; validate record extents and hashes.
+  GUID temporary files and unique `original-<GUID>.bundle` / `.record` pairs during
+  replacement/recovery. Never put backup/temp files matching `info*` at the set root.
+  Never overwrite an existing backup. Record basenames only with bounded lengths;
+  validate record extents and hashes.
 - Use the installed Mono's supported atomic File.Replace with a unique backup. There
   is no truncate/copy-over-source fallback. Recheck source identity/hash under an
   exclusive handle before commit; verify the captured backup and new source afterward.
-  Commit and rollback are non-cancellable critical sections retaining both versions.
-  Unsupported, locked and failed inputs retain usable originals; clean only owned temps.
-- Restore mode takes precedence over optimization, only replaces a source matching the
-  recorded optimized hash, validates the original backup, and preserves the displaced
-  optimized copy. Never restore over a later map update or corrupt recovery record.
+  Commit and rollback are non-cancellable critical sections retaining both versions
+  until verification completes. Unsupported or locked inputs stay unchanged; never
+  treat unverified or mismatched data as successful cleanup.
+- In 1.7.0, delete the original backup and record after successful commit and recorded
+  source/backup length/hash verification. Normal optimization startup also cleans old
+  successful pairs only when the current source has an independent layout and matches
+  the recorded output, and the backup matches the recorded original. Classify legacy
+  pairs by content: schema-1 records have no success flag. Unverified records/backups,
+  failed-output files and unmatched recovery data from later map updates must remain. Cleanup failure must not roll back a valid
+  LZ4 source; retain remaining records/files for retry. Do not promise permanent originals
+  or restoration after successful cleanup; obtaining the original requires a fresh map copy.
+- Restore mode takes precedence over optimization and successful-backup cleanup. It
+  only applies to legacy/recovery backups and records that still exist; never clean
+  them before attempting restoration. Only replace a source matching the recorded
+  optimized hash, validate the original backup, and preserve the displaced optimized
+  copy. Never restore over a later map update or corrupt recovery record.
 - Existing independent LZ4/raw layouts skip conversion after bounded structural checks.
   Do not rewrite their timestamps each startup. File-length/mtime fingerprints must
   invalidate catalog, graph and thumbnail data naturally when replacement occurs.

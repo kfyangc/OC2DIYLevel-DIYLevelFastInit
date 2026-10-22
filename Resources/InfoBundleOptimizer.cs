@@ -7,7 +7,7 @@ using DIYLevelFastInit.BundleCodecs;
 
 namespace DIYLevelFastInit
 {
-    /// <summary>Replaces one info bundle with a verified independent bundle while retaining its original.</summary>
+    /// <summary>Verifies in-place info replacements and removes originals only after successful validation.</summary>
     internal static class InfoBundleOptimizer
     {
         internal enum Result { Replaced, AlreadyOptimized, Unsupported, Failed, Restored, NoBackup }
@@ -34,6 +34,7 @@ namespace DIYLevelFastInit
                 {
                     if (UnityFsRepacker.IsIndependent(source))
                     {
+                        CleanupOriginals(source, directory, cancelled, log);
                         Log(log, "info bundle already optimized: " + System.IO.Path.GetFileName(source));
                         return Result.AlreadyOptimized;
                     }
@@ -70,7 +71,9 @@ namespace DIYLevelFastInit
                     if (!Commit(source, converted, record.Backup, record.SourceLength, record.SourceHash,
                         record.OutputLength, record.OutputHash, directory, log)) return Result.Failed;
                     converted = null;
-                    Log(log, "info bundle optimized in place: " + source + " (original: " + record.Backup + ")");
+                    CheckCancelled(cancelled);
+                    CleanupOriginal(source, record, log);
+                    Log(log, "info bundle optimized in place: " + source);
                     return Result.Replaced;
                 }
             }
@@ -78,6 +81,57 @@ namespace DIYLevelFastInit
             catch (Exception error) { Log(log, "info bundle optimization failed; original/recovery files retained: " + source + "\n" + error); return Result.Failed; }
             finally { DeleteTemporary(converted, log); DeleteTemporary(recordTemporary, log); }
         }
+
+        private static void CleanupOriginals(string source, string directory, Func<bool> cancelled, Action<string> log)
+        {
+            string[] paths;
+            try { paths = Directory.GetFiles(directory, "original-*.record"); }
+            catch (Exception error) { Log(log, "original backup cleanup deferred; optimized source retained: " + source + "\n" + error); return; }
+            foreach (string path in paths)
+            {
+                CheckCancelled(cancelled);
+                if (!RecordName(path)) continue;
+                try
+                {
+                    Record record = ReadRecord(path);
+                    if (string.Equals(record.Name, System.IO.Path.GetFileName(source), StringComparison.OrdinalIgnoreCase)) CleanupOriginal(source, record, log);
+                }
+                catch (Exception error) { Log(log, "invalid original record retained during cleanup: " + path + "\n" + error); }
+            }
+        }
+
+        private static void CleanupOriginal(string source, Record record, Action<string> log)
+        {
+            try
+            {
+                using (FileStream current = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.None))
+                {
+                    if (current.Length != record.OutputLength || !Same(HashStream(current, null), record.OutputHash))
+                    {
+                        Log(log, "original backup retained: current info bundle differs from the optimized record: " + source);
+                        return;
+                    }
+                    if (CleanupFileExists(record.Backup))
+                    {
+                        using (FileStream original = new FileStream(record.Backup, FileMode.Open, FileAccess.Read, FileShare.Read))
+                            if (original.Length != record.SourceLength || !Same(HashStream(original, null), record.SourceHash))
+                            {
+                                Log(log, "original backup retained: backup differs from its record: " + record.Backup);
+                                return;
+                            }
+                        File.Delete(record.Backup);
+                        if (CleanupFileExists(record.Backup)) throw new IOException("Original backup still exists after deletion");
+                    }
+                    File.Delete(record.Path);
+                    if (CleanupFileExists(record.Path)) throw new IOException("Original record still exists after deletion");
+                    Log(log, "verified original backup and record removed: " + record.Backup);
+                }
+            }
+            catch (Exception error) { Log(log, "original backup cleanup deferred; optimized source retained: " + source + "\n" + error); }
+        }
+
+        private static bool CleanupFileExists(string path)
+        { return Directory.GetFileSystemEntries(System.IO.Path.GetDirectoryName(path), System.IO.Path.GetFileName(path)).Length != 0; }
 
         internal static Result Restore(string source, Func<bool> cancelled, Action<string> log)
         {

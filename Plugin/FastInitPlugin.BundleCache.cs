@@ -15,9 +15,9 @@ namespace DIYLevelFastInit
                 UseIndividualLevelAssets = Config.Bind("Loading", "EnableIndividualLevelAssets", true,
                     "Load the selected LevelInfo asset when its address is unambiguous; fall back to LevelSetInfo when needed. Restart after changing this option.").Value;
                 OptimizeInfoFilesOnStartup = Config.Bind("Loading", "OptimizeInfoBundlesOnStartup", true,
-                    "Check custom-level info bundles on startup and replace supported LZMA files with equivalent LZ4 files before discovering levels. Original files are backed up beside each set. Restart after changing this option.").Value;
+                    "Check custom-level info bundles on startup and replace supported LZMA files with equivalent LZ4 files before discovering levels. Temporary originals are deleted after successful verification; matching originals from earlier conversions are also cleaned up. Restart after changing this option.").Value;
                 RestoreInfoFilesOnStartup = Config.Bind("Loading", "RestoreOriginalInfoBundlesOnStartup", false,
-                    "Restore backed-up original info bundles on startup. Restoration takes precedence over optimization. Restart after changing this option.").Value;
+                    "Restore matching legacy or recovery originals that still exist. Successfully optimized files whose temporary originals were deleted cannot be restored by the plugin. Restoration takes precedence over optimization and cleanup. Restart after changing this option.").Value;
                 Log.LogInfo("info bundles use source files directly; runtime LZ4 cache is disabled (legacy cache options are ignored)");
             }
             catch (Exception e) { Log.LogWarning("info bundle startup options unavailable; defaults retained: " + e.Message); }
