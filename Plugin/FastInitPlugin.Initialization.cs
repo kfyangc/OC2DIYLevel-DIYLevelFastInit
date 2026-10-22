@@ -20,6 +20,7 @@ namespace DIYLevelFastInit
                 return false;
             }
             _started = true;
+            InfoFilesPreparing = true;
             try
             {
                 string pluginDir = GetDiyPluginDir();
@@ -27,6 +28,7 @@ namespace DIYLevelFastInit
                 {
                     // Same failure conditions as the original (missing common file etc.); allow a retry.
                     _started = false;
+                    InfoFilesPreparing = false;
                     return false;
                 }
                 GameObject host = new GameObject("DIYLevelFastInitHost");
@@ -36,6 +38,7 @@ namespace DIYLevelFastInit
             catch (Exception e)
             {
                 _started = false;
+                if (_infoOptimization == null || _infoOptimization.Done) InfoFilesPreparing = false;
                 Log.LogError("FastInit init failed (DIY levels unavailable this attempt): " + e);
             }
             return false;

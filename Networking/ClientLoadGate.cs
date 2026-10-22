@@ -57,7 +57,9 @@ namespace DIYLevelFastInit
             if (!DIYLevelAssetBundleManager.IsInitialized || !bReliable) return true;
             LevelLoadByNameMessage level = message as LevelLoadByNameMessage;
             string path;
-            if (level == null || !OnDemandResources.TryFindScenePath(level.m_Scene, out path))
+            if (level == null || (!OnDemandResources.TryFindScenePath(level.m_Scene, out path)
+                && (!(FastInitPlugin.InfoFilesPreparing || FastInitPlugin.Loading)
+                    || !OnDemandResources.TryFindInstalledScenePath(level.m_Scene, out path))))
             {
                 Cancel("another scene requested");
                 return true;
@@ -71,7 +73,6 @@ namespace DIYLevelFastInit
                 FastInitPlugin.Log.LogDebug("duplicate DIY client level message ignored: " + level.m_Scene);
                 return false;
             }
-            OnDemandResources.BeginClientPreparation(level.m_Scene);
             _traceScene = level.m_Scene;
             _traceClock = System.Diagnostics.Stopwatch.StartNew();
             FastInitPlugin.Log.LogInfo("DIY client level message deferred: " + level.m_Scene);
@@ -130,7 +131,12 @@ namespace DIYLevelFastInit
                             FastInitPlugin.Log.LogInfo("DIY client loading acknowledged before resources: " + request.Message.m_Scene
                                 + " (" + request.Message.m_StartLoadGameState + ")");
                         yield return OnDemandResources.FinishSaveSelection(() => IsCurrent(request), "client", owned => view = owned);
+                        while (IsCurrent(request) && (FastInitPlugin.InfoFilesPreparing || FastInitPlugin.Loading)) yield return null;
                         if (!IsCurrent(request)) continue;
+                        string resolved;
+                        if (!OnDemandResources.TryFindScenePath(request.Message.m_Scene, out resolved)
+                            || !string.Equals(resolved, request.Path, StringComparison.OrdinalIgnoreCase)) continue;
+                        OnDemandResources.BeginClientPreparation(request.Message.m_Scene);
                         Box<bool> ready = new Box<bool>();
                         yield return FastInitHost.Guard(OnDemandResources.PrepareClientLevel(request.Path, request.Message.m_Scene,
                             () => IsCurrent(request), ready), "DIY client preparation [" + request.Message.m_Scene + "]");

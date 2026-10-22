@@ -2,7 +2,7 @@
 
 BepInEx 5 plugin (net35) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.17 keeps a complete lightweight level catalog while loading info resources
+Version 1.6.18 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
 
@@ -300,33 +300,45 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   uncached preview scene. Keep container/CAB dependencies and cache-file leases until
   their last active, pending, preview or warmup owner has finished.
 
-## Disposable bundle cache
+## Startup info bundle optimization
 
-- Generated independent LZ4/raw blocks must use flags `0x02`/`0x00`. Never copy the
-  source LZMA `Streamed=0x40` bit: this game's native LZ4 stream callbacks return false,
-  even when a generic LZ4 parser accepts the compressed bytes. Whole-bundle Unity
-  acceptance is distinct from isolated decoder and managed Mono validation.
-- `BundleFileCache.FormatVersion` is part of the cache key. Bump it for incompatible
-  generated layouts so earlier bundles and persistent `.bad` markers cannot mask a fix.
-  Keep metadata schema changes separate from converter-format changes.
-
-- `BundleFileCache` is pure managed code. Its single low-priority worker must not call
-  Unity/BepInEx APIs; `Tick` gates idle work and forwards queued diagnostics on the main thread.
-- Compatible single-block LZMA `info*` sources are eligible. Remember unsupported
-  layouts for that fingerprint in the current process. Keep all original
-  path keys, CAB names, dependencies and source files intact. Cache misses must return
-  the original path without waiting for conversion or whole-file hash validation.
-- Cache files are leased through both native request completion and loaded container
-  lifetime. Release the lease after `Unload(false)`, never when an async wait is cancelled.
-  Retry original input only after the cached native request completes or fails to start.
-- Validate source/output hashes off-thread, publish metadata last, retain fingerprinted
-  rejection markers, and respect the configurable published-data budget (2 GiB default,
-  128–16384 MiB). Validate queued existing entries before starting new conversions;
-  background Queue/validation must not refresh existing LRU times or pin files.
-  Keep the per-output parser bound separate from the aggregate budget. Interrupted temporary
-  files may be removed only while holding the matching cross-process lock.
-- `UnityFsRepacker` streams 128 KiB blocks using the original bounded LZMA dictionary;
-  never reuse the graph reader's prefix-only decoder clamp or retain the entire payload.
+- The owner authorized replacing `info*` files in 1.6.18. `InfoBundleOptimizer`
+  converts supported single-block LZMA inputs and atomically replaces their original
+  paths only after `ValidateConverted` checks output/source file hashes, complete
+  decoded-data hash, block bounds and equivalent versions/CAB/node metadata.
+- Generated independent blocks use flags `0x02`/`0x00`, never the source's Streamed
+  bit `0x40`; the installed Unity's LZ4 stream callbacks fail. A generic parser or
+  successful managed conversion does not establish full native Unity acceptance.
+- `InfoBundleOptimizationBatch` owns one cancellable managed worker. Its callbacks
+  only enqueue diagnostics; main-thread Update drains them. Set `InfoFilesPreparing`
+  before cheap initialization and retain it until the worker has fully exited, including
+  coroutine disposal. Never call Unity or BepInEx from the worker.
+- Complete this startup phase before any info graph/catalog/preview/native request.
+  Keep synchronous `common` initialization and IsInitialized timing unchanged. Do not
+  replace files during hot refresh. Early remote DIY messages may use a basename-only
+  file lookup while the catalog is empty, but must retain copied payloads, acknowledge
+  start and wait for startup/catalog completion before BeginClientPreparation. Setting
+  `_pendingScene` early would deadlock discovery's transition wait.
+- Every set's `.diylevel-fastinit` child directory holds the cross-process lock,
+  GUID temporary files and unique `original-<GUID>.bundle` / `.record` pairs. Never put
+  backup/temp files matching `info*` at the set root. Never overwrite an existing backup.
+  Record basenames only with bounded lengths; validate record extents and hashes.
+- Use the installed Mono's supported atomic File.Replace with a unique backup. There
+  is no truncate/copy-over-source fallback. Recheck source identity/hash under an
+  exclusive handle before commit; verify the captured backup and new source afterward.
+  Commit and rollback are non-cancellable critical sections retaining both versions.
+  Unsupported, locked and failed inputs retain usable originals; clean only owned temps.
+- Restore mode takes precedence over optimization, only replaces a source matching the
+  recorded optimized hash, validates the original backup, and preserves the displaced
+  optimized copy. Never restore over a later map update or corrupt recovery record.
+- Existing independent LZ4/raw layouts skip conversion after bounded structural checks.
+  Do not rewrite their timestamps each startup. File-length/mtime fingerprints must
+  invalidate catalog, graph and thumbnail data naturally when replacement occurs.
+- `BundleFileCache` remains legacy managed code for historical compatibility checks;
+  production no longer Configure/Queue/Acquire/Tick it or select its physical paths.
+  Old bundle-cache options are ignored. Scalar catalog/thumbnail caches are separate.
+- `UnityFsRepacker` streams 128 KiB output blocks with bounded buffers and the original
+  LZMA dictionary. Never retain the entire resource payload or clamp its dictionary.
 
 ## Constraints
 

@@ -20,7 +20,7 @@ namespace DIYLevelFastInit
     {
         public const string PluginGuid = "oc2.diylevel.fastinit";
         public const string PluginName = "DIYLevel FastInit";
-        public const string PluginVersion = "1.6.17";
+        public const string PluginVersion = "1.6.18";
 
         internal static ManualLogSource Log;
 
@@ -48,6 +48,11 @@ namespace DIYLevelFastInit
 
         private static GUIStyle _progressStyle;
         internal static bool UseIndividualLevelAssets = true;
+        internal static bool InfoFilesPreparing;
+        internal static bool OptimizeInfoFilesOnStartup = true;
+        internal static bool RestoreInfoFilesOnStartup;
+        private static InfoBundleOptimizationBatch _infoOptimization;
+        internal static string InfoOptimizationProgress;
 
         private void Awake()
         {
@@ -98,6 +103,7 @@ namespace DIYLevelFastInit
 
         private void OnDestroy()
         {
+            if (_infoOptimization != null) _infoOptimization.Dispose();
             OnDemandResources.ResetSaveSelection();
             ClientLoadGate.Cancel("plugin shutdown");
             OnDemandResources.CancelServerPreparation("plugin shutdown");

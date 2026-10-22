@@ -12,9 +12,10 @@ namespace DIYLevelFastInit
         private void OnGUI()
         {
             bool catalogLoading = Loading && TotalSets > 0;
+            string infoPreparing = InfoOptimizationProgress;
             string levelLoading = OnDemandResources.LevelLoadProgress;
             bool thumbnails = OnDemandResources.WarmingThumbnails && !OnDemandResources.IsTransitioning && !PseudoPrefabManager.isInCustomLevel;
-            if (!catalogLoading && !thumbnails && levelLoading == null)
+            if (!catalogLoading && !thumbnails && levelLoading == null && infoPreparing == null)
             {
                 return;
             }
@@ -29,7 +30,8 @@ namespace DIYLevelFastInit
                 }
                 List<KeyValuePair<string, LevelSetInfoSO>> infos = DIYLevelAssetBundleManager.levelSetInfos;
                 int done = (infos != null) ? infos.Count : 0;
-                string text = levelLoading != null ? "DIY level preparing " + levelLoading
+                string text = infoPreparing != null ? "DIY info " + infoPreparing
+                    : levelLoading != null ? "DIY level preparing " + levelLoading
                     : catalogLoading ? "DIY levels loading " + done + "/" + TotalSets
                     : "DIY previews caching " + OnDemandResources.ThumbnailDone + "/" + OnDemandResources.ThumbnailTotal;
                 Rect rect = new Rect(Screen.width - 336, 6, 330, 26);

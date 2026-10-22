@@ -34,6 +34,7 @@ namespace DIYLevelFastInit
 
         internal static IEnumerator LoadCatalogBundle(string path, Box<AssetBundle> result)
         {
+            while (FastInitPlugin.InfoFilesPreparing) yield return null;
             _catalogBundles = InfoBundleGraph.Required(path, null);
             foreach (string required in _catalogBundles)
                 yield return EnsureInfoBundleAsync(required);
@@ -42,6 +43,7 @@ namespace DIYLevelFastInit
 
         private static IEnumerator EnsureInfoBundleAsync(string path, int priority = 0)
         {
+            while (FastInitPlugin.InfoFilesPreparing) yield return null;
             if (QichiResources.IsRequired(path)) yield return QichiResources.EnsureAsync();
             if (InfoBundles.ContainsKey(path)) yield break;
             AssetBundleCreateRequest request;
@@ -75,6 +77,7 @@ namespace DIYLevelFastInit
 
         private static AssetBundle GetInfoBundle(string path)
         {
+            if (FastInitPlugin.InfoFilesPreparing) throw new InvalidOperationException("DIY info bundle files are being prepared; retry after startup completes");
             if (QichiResources.IsRequired(path)) QichiResources.Ensure();
             AssetBundle bundle;
             if (InfoBundles.TryGetValue(path, out bundle)) return bundle;
@@ -87,7 +90,6 @@ namespace DIYLevelFastInit
                     bundle = request.assetBundle;
                     if (bundle == null && request.isDone)
                     {
-                        RejectCachedInfoBundle(path);
                         ReleaseInfoBundleLease(path);
                         bundle = AssetBundle.LoadFromFile(path);
                     }
@@ -106,55 +108,16 @@ namespace DIYLevelFastInit
 
         private static AssetBundleCreateRequest StartInfoBundleRequest(string path)
         {
-            BundleFileCache.Lease lease = BundleFileCache.Acquire(path);
-            InfoBundleLeases.Add(path, lease);
-            try
-            {
-                FastInitPlugin.Log.LogInfo("info bundle source: " + Path.GetFileName(path) + (lease.IsCached ? " (LZ4 cache)" : " (original)"));
-                AssetBundleCreateRequest request = AssetBundle.LoadFromFileAsync(lease.Path);
-                if (request == null) throw new IOException("Cannot start info dependency: " + path);
-                return request;
-            }
-            catch
-            {
-                bool retry = lease.IsCached;
-                RejectCachedInfoBundle(path);
-                ReleaseInfoBundleLease(path);
-                if (!retry) throw;
-                AssetBundleCreateRequest request = AssetBundle.LoadFromFileAsync(path);
-                if (request == null) throw new IOException("Cannot start original info dependency: " + path);
-                return request;
-            }
+            FastInitPlugin.Log.LogInfo("info bundle source: " + Path.GetFileName(path) + " (source file)");
+            AssetBundleCreateRequest request = AssetBundle.LoadFromFileAsync(path);
+            if (request == null) throw new IOException("Cannot start info dependency: " + path);
+            return request;
         }
 
         private static AssetBundle LoadInfoBundleFile(string path)
         {
-            BundleFileCache.Lease lease = BundleFileCache.Acquire(path);
-            InfoBundleLeases.Add(path, lease);
-            AssetBundle bundle;
-            try { bundle = AssetBundle.LoadFromFile(lease.Path); }
-            catch
-            {
-                bool retry = lease.IsCached;
-                RejectCachedInfoBundle(path);
-                ReleaseInfoBundleLease(path);
-                if (!retry) throw;
-                return AssetBundle.LoadFromFile(path);
-            }
-            if (bundle != null || !lease.IsCached) return bundle;
-            RejectCachedInfoBundle(path);
-            ReleaseInfoBundleLease(path);
+            FastInitPlugin.Log.LogInfo("info bundle source: " + Path.GetFileName(path) + " (source file)");
             return AssetBundle.LoadFromFile(path);
-        }
-
-        private static void RejectCachedInfoBundle(string path)
-        {
-            BundleFileCache.Lease lease;
-            if (InfoBundleLeases.TryGetValue(path, out lease) && lease.IsCached)
-            {
-                BundleFileCache.Reject(path, lease.Path);
-                FastInitPlugin.Log.LogWarning("cached info bundle rejected by Unity; retrying original: " + Path.GetFileName(path));
-            }
         }
 
         private static void ReleaseInfoBundleLease(string path)
@@ -167,6 +130,7 @@ namespace DIYLevelFastInit
 
         private static LoadedSet LoadSet(string path, string scene = null)
         {
+            if (FastInitPlugin.InfoFilesPreparing) throw new InvalidOperationException("DIY info bundle files are being prepared; retry after startup completes");
             LoadedSet loaded;
             bool exists = Sets.TryGetValue(path, out loaded);
             if (exists && scene != null && loaded.SceneDependencies.ContainsKey(scene) && loaded.LoadedLevels.ContainsKey(scene)) return loaded;

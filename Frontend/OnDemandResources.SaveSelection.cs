@@ -109,7 +109,7 @@ namespace DIYLevelFastInit
 
         private static bool SelectionPrefix()
         {
-            if (FastInitPlugin.Syncing || IsSaveEntryActive || _catalogBundles != null) return false;
+            if (FastInitPlugin.InfoFilesPreparing || FastInitPlugin.Syncing || IsSaveEntryActive || _catalogBundles != null) return false;
             if (_selectionFrame == Time.frameCount || (_visibleSaveDialog != null && _visibleSaveDialog.gameObject.activeInHierarchy))
             {
                 FastInitPlugin.Log.LogInfo("duplicate DIY level selection ignored: save dialog already opening/open");

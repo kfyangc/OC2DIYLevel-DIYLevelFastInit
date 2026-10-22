@@ -27,6 +27,7 @@ namespace DIYLevelFastInit
 
         private static bool PreviewPrefix(Image __0, LevelInfoSO level)
         {
+            if (FastInitPlugin.InfoFilesPreparing) return false;
             if (__0 == null) return true;
             if (level == null)
             {
@@ -53,7 +54,7 @@ namespace DIYLevelFastInit
         {
             return ReferenceEquals(_previewRequest, request) && request.Image != null && request.Level != null
                 && request.Image.transform.parent != null && request.Image.transform.parent.gameObject.activeInHierarchy
-                && !FastInitPlugin.Syncing && !IsTransitioning && !PseudoPrefabManager.isInCustomLevel;
+                && !FastInitPlugin.InfoFilesPreparing && !FastInitPlugin.Syncing && !IsTransitioning && !PseudoPrefabManager.isInCustomLevel;
         }
 
         private static IEnumerator PreviewRoutine()

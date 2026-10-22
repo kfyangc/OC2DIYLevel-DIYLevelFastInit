@@ -26,10 +26,11 @@ namespace DIYLevelFastInit.BundleCodecs
         private sealed class Layout
         {
             internal byte[] UnityVersion, Revision, Hash, Properties;
-            internal long DataStart, SourceLength;
+            internal long DataStart, SourceLength, DataLength;
             internal uint Flags, Plain, Packed;
             internal ushort BlockFlags;
             internal readonly List<Node> Nodes = new List<Node>();
+            internal readonly List<Block> Blocks = new List<Block>();
         }
 
         private sealed class Block
@@ -55,6 +56,72 @@ namespace DIYLevelFastInit.BundleCodecs
             catch (ArgumentException) { return false; }
             catch (NotSupportedException) { return false; }
             catch (System.Security.SecurityException) { return false; }
+        }
+
+        internal static bool IsIndependent(string path)
+        {
+            try
+            {
+                using (FileStream stream = OpenSource(path)) ReadIndependentLayout(stream);
+                return true;
+            }
+            catch (System.IO.IsolatedStorage.IsolatedStorageException) { return false; }
+            catch (IOException) { return false; }
+            catch (UnauthorizedAccessException) { return false; }
+            catch (ArgumentException) { return false; }
+            catch (NotSupportedException) { return false; }
+            catch (System.Security.SecurityException) { return false; }
+        }
+
+        internal static void ValidateConverted(string source, string output, ConversionResult result, Func<bool> cancelled)
+        {
+            if (result == null || result.SourceLength <= 0 || result.SourceLength > MaxBytes
+                || result.OutputLength <= 0 || result.OutputLength > MaxBytes || result.DataLength <= 0
+                || result.DataLength > MaxBytes || result.BlockCount <= 0 || result.SourceHash == null
+                || result.SourceHash.Length != 32 || result.OutputHash == null || result.OutputHash.Length != 32
+                || result.DataHash == null || result.DataHash.Length != 32) throw new IOException("Invalid conversion result");
+            Check(cancelled, null);
+            using (FileStream input = OpenSource(source))
+            using (FileStream converted = OpenSource(output))
+            {
+                Layout before = ReadLayout(input), after = ReadIndependentLayout(converted);
+                if (before.SourceLength != result.SourceLength || after.SourceLength != result.OutputLength
+                    || before.Plain != result.DataLength || after.DataLength != result.DataLength
+                    || after.Blocks.Count != result.BlockCount || after.Blocks.Count != (result.DataLength + ChunkSize - 1) / ChunkSize
+                    || after.Flags != (before.Flags & 64U) || !Same(before.UnityVersion, after.UnityVersion)
+                    || !Same(before.Revision, after.Revision) || !Same(before.Hash, after.Hash)
+                    || before.Nodes.Count != after.Nodes.Count) throw new IOException("Converted UnityFS layout changed");
+                for (int i = 0; i < before.Nodes.Count; i++)
+                {
+                    Node a = before.Nodes[i], b = after.Nodes[i];
+                    if (a.Offset != b.Offset || a.Size != b.Size || a.Flags != b.Flags || !Same(a.Name, b.Name))
+                        throw new IOException("Converted UnityFS directory changed");
+                }
+                if (!Same(HashStream(input, before.SourceLength, cancelled, null), result.SourceHash)
+                    || !Same(HashStream(converted, after.SourceLength, cancelled, null), result.OutputHash))
+                    throw new IOException("Converted UnityFS file hash changed");
+                byte[] packed = new byte[ChunkSize + ChunkSize / 255 + 16], plain = new byte[ChunkSize];
+                converted.Position = after.DataStart;
+                using (SHA256 hash = SHA256.Create())
+                {
+                    for (int i = 0; i < after.Blocks.Count; i++)
+                    {
+                        Check(cancelled, null);
+                        Block block = after.Blocks[i];
+                        if (block.Plain > ChunkSize || block.Packed > packed.Length
+                            || (i != after.Blocks.Count - 1 && block.Plain != ChunkSize)
+                            || (block.Flags != 0 && block.Flags != 2)) throw new IOException("Invalid converted UnityFS block");
+                        int count = (int)block.Packed, length = (int)block.Plain;
+                        ReadExact(converted, packed, count);
+                        if (block.Flags == 0) Buffer.BlockCopy(packed, 0, plain, 0, length);
+                        else DecodeLz4(packed, count, plain, length, true);
+                        hash.TransformBlock(plain, 0, length, plain, 0);
+                    }
+                    hash.TransformFinalBlock(new byte[0], 0, 0);
+                    if (!Same(hash.Hash, result.DataHash)) throw new IOException("Converted UnityFS payload hash changed");
+                }
+                Check(cancelled, null);
+            }
         }
 
         internal static ConversionResult Convert(string source, string destination, Func<bool> cancelled)
@@ -123,6 +190,35 @@ namespace DIYLevelFastInit.BundleCodecs
 
         private static Layout ReadLayout(FileStream stream)
         {
+            Layout result = ReadContainerLayout(stream);
+            if (result.Blocks.Count != 1) throw new IOException("Only single-block source bundles are eligible");
+            Block block = result.Blocks[0];
+            result.Plain = block.Plain;
+            result.Packed = block.Packed;
+            result.BlockFlags = block.Flags;
+            if ((result.BlockFlags & ~127) != 0 || (result.BlockFlags & 63) != 1 || result.Packed < 10)
+                throw new IOException("Unsupported UnityFS source block");
+            stream.Position = result.DataStart;
+            result.Properties = Exact(stream, 5);
+            ValidateProperties(result.Properties);
+            return result;
+        }
+
+        private static Layout ReadIndependentLayout(FileStream stream)
+        {
+            Layout result = ReadContainerLayout(stream);
+            foreach (Block block in result.Blocks)
+            {
+                if ((block.Flags != 0 && block.Flags != 2 && block.Flags != 3)
+                    || (block.Flags == 0 && block.Packed != block.Plain)
+                    || block.Packed > (long)block.Plain + block.Plain / 255 + 16)
+                    throw new IOException("Unsupported independent UnityFS block");
+            }
+            return result;
+        }
+
+        private static Layout ReadContainerLayout(FileStream stream)
+        {
             if (stream.Length > MaxBytes || stream.Length < 40) throw new IOException("Unsupported UnityFS file size");
             if (Encoding.ASCII.GetString(CString(stream, 8)) != "UnityFS" || U32(stream) != 6) throw new IOException("Unsupported UnityFS header");
             Layout result = new Layout();
@@ -143,15 +239,20 @@ namespace DIYLevelFastInit.BundleCodecs
             using (MemoryStream table = new MemoryStream(metadata, false))
             {
                 result.Hash = Exact(table, 16);
-                if (U32(table) != 1) throw new IOException("Only single-block source bundles are eligible");
-                result.Plain = U32(table);
-                result.Packed = U32(table);
-                result.BlockFlags = U16(table);
-                if ((result.BlockFlags & ~127) != 0 || (result.BlockFlags & 63) != 1 || result.Plain == 0
-                    || result.Plain > MaxBytes || result.Packed < 10 || result.Packed > MaxBytes)
-                    throw new IOException("Unsupported UnityFS source block");
+                int blocks = Bounded(U32(table), 65536);
+                if (blocks == 0 || blocks > (table.Length - table.Position - 4) / 10) throw new IOException("Invalid UnityFS block count");
+                long packedLength = 0;
+                for (int i = 0; i < blocks; i++)
+                {
+                    Block block = new Block { Plain = U32(table), Packed = U32(table), Flags = U16(table) };
+                    if (block.Plain == 0 || block.Packed == 0 || block.Plain > MaxBytes - result.DataLength
+                        || block.Packed > MaxBytes - packedLength) throw new IOException("Invalid UnityFS block extent");
+                    result.DataLength += block.Plain;
+                    packedLength += block.Packed;
+                    result.Blocks.Add(block);
+                }
                 long expectedEnd = atEnd ? metadataStart : stream.Length;
-                if (result.DataStart + result.Packed != expectedEnd) throw new IOException("Invalid UnityFS data extent");
+                if (result.DataStart + packedLength != expectedEnd) throw new IOException("Invalid UnityFS data extent");
                 int nodes = Bounded(U32(table), 20000);
                 if (nodes == 0) throw new IOException("UnityFS has no directory nodes");
                 for (int i = 0; i < nodes; i++)
@@ -159,14 +260,11 @@ namespace DIYLevelFastInit.BundleCodecs
                     ulong offset = U64(table), size = U64(table);
                     uint flags = U32(table);
                     byte[] name = CString(table, 4096);
-                    if (offset > result.Plain || size > result.Plain - offset) throw new IOException("UnityFS node exceeds the data extent");
+                    if (offset > (ulong)result.DataLength || size > (ulong)result.DataLength - offset) throw new IOException("UnityFS node exceeds the data extent");
                     result.Nodes.Add(new Node { Offset = (long)offset, Size = (long)size, Flags = flags, Name = name });
                 }
                 if (table.Position != table.Length) throw new IOException("Trailing UnityFS metadata");
             }
-            stream.Position = result.DataStart;
-            result.Properties = Exact(stream, 5);
-            ValidateProperties(result.Properties);
             return result;
         }
 
@@ -197,36 +295,45 @@ namespace DIYLevelFastInit.BundleCodecs
             }
             if (compression != 2 && compression != 3) throw new IOException("Unsupported UnityFS metadata compression");
             byte[] bytes = new byte[length];
+            DecodeLz4(packed, packed.Length, bytes, length, false);
+            return bytes;
+        }
+
+        private static void DecodeLz4(byte[] packed, int packedLength, byte[] bytes, int length, bool strictEnd)
+        {
             int source = 0, target = 0;
-            while (source < packed.Length)
+            int finalLiterals = -1, lastMatch = -1;
+            while (source < packedLength)
             {
                 int token = packed[source++];
-                int literals = Lz4Length(packed, ref source, token >> 4);
-                if (literals > packed.Length - source || literals > bytes.Length - target) throw new IOException("Invalid LZ4 literal");
+                int literals = Lz4Length(packed, ref source, token >> 4, packedLength);
+                if (literals > packedLength - source || literals > length - target) throw new IOException("Invalid LZ4 literal");
                 Buffer.BlockCopy(packed, source, bytes, target, literals);
                 source += literals;
                 target += literals;
-                if (source == packed.Length) break;
-                if (source > packed.Length - 2) throw new IOException("Truncated LZ4 distance");
+                if (source == packedLength) { finalLiterals = literals; break; }
+                if (source > packedLength - 2) throw new IOException("Truncated LZ4 distance");
                 int distance = packed[source] | packed[source + 1] << 8;
                 source += 2;
                 if (distance == 0 || distance > target) throw new IOException("Invalid LZ4 distance");
-                int match = Lz4Length(packed, ref source, token & 15) + 4;
-                if (match > bytes.Length - target) throw new IOException("Invalid LZ4 match");
+                int match = Lz4Length(packed, ref source, token & 15, packedLength) + 4;
+                if (match > length - target) throw new IOException("Invalid LZ4 match");
+                lastMatch = target;
                 int end = target + match;
                 while (target < end) { bytes[target] = bytes[target - distance]; target++; }
             }
             if (target != length) throw new IOException("LZ4 metadata length mismatch");
-            return bytes;
+            if (strictEnd && (finalLiterals < Math.Min(5, length) || (lastMatch >= 0 && lastMatch > length - 12)))
+                throw new IOException("Invalid LZ4 final sequence");
         }
 
-        private static int Lz4Length(byte[] bytes, ref int position, int length)
+        private static int Lz4Length(byte[] bytes, ref int position, int length, int limit)
         {
             if (length != 15) return length;
             int next;
             do
             {
-                if (position == bytes.Length || length > MaxMetadata) throw new IOException("Invalid LZ4 length");
+                if (position == limit || length > MaxMetadata) throw new IOException("Invalid LZ4 length");
                 next = bytes[position++];
                 length += next;
             } while (next == 255);
@@ -398,10 +505,21 @@ namespace DIYLevelFastInit.BundleCodecs
         }
 
         private static int Bounded(uint value, int max) { if (value > max) throw new IOException("UnityFS field exceeds its limit"); return (int)value; }
+        private static bool Same(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+            return true;
+        }
+        private static void ReadExact(Stream stream, byte[] bytes, int count)
+        {
+            int position = 0;
+            while (position < count) { int read = stream.Read(bytes, position, count - position); if (read == 0) throw new IOException("Truncated UnityFS file"); position += read; }
+        }
         private static byte[] Exact(Stream stream, int count)
         {
-            byte[] bytes = new byte[count]; int position = 0;
-            while (position < count) { int read = stream.Read(bytes, position, count - position); if (read == 0) throw new IOException("Truncated UnityFS file"); position += read; }
+            byte[] bytes = new byte[count];
+            ReadExact(stream, bytes, count);
             return bytes;
         }
         private static byte[] CString(Stream stream, int limit)

@@ -60,6 +60,7 @@ namespace DIYLevelFastInit
 
         private static void LoadPrefix(string sceneName)
         {
+            if (FastInitPlugin.InfoFilesPreparing) throw new InvalidOperationException("DIY info bundles are being prepared; wait for startup to finish");
             if (FastInitPlugin.Syncing) throw new InvalidOperationException("DIY catalog refresh is in progress; retry after it completes");
             try { PrepareLevel(sceneName); }
             catch (Exception e)
@@ -75,6 +76,7 @@ namespace DIYLevelFastInit
         private static bool ServerLoadPrefix(string sceneName)
         {
             if (_resumeServerLoad) return true;
+            if (FastInitPlugin.InfoFilesPreparing) return false;
             if (FastInitPlugin.Syncing) throw new InvalidOperationException("DIY catalog refresh is in progress; retry after it completes");
             if (_serverPreparing)
             {

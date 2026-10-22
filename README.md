@@ -4,6 +4,22 @@ Startup and memory optimization for the [OC2DIYLevel](https://github.com/gua248/
 
 [中文说明](README_CN.md)
 
+## Version 1.6.18: optimize source info files at startup
+
+Stop generating or loading separate LZ4 resource caches. On every startup, inspect each map's top-level `info*` files. Skip independent LZ4/raw layouts; convert supported single-block LZMA files serially on a managed worker, verify file hashes, full decoded-data hash, CAB/node directories and versions, then atomically replace the original path. Discovery, previews, host/client entry and original-mod callers all read the optimized source file.
+
+Originals are retained as `.diylevel-fastinit/original-<GUID>.bundle` beside each map, with a `.record` containing the basename and before/after hashes. Backups and temporary files cannot enter top-level `info*` enumeration. Locked, unsupported, unwritable or invalid inputs remain unchanged and are reported. Commit/rollback retain complete recovery files; cancellation never writes a partial source bundle.
+
+Settings in `BepInEx/config/oc2.diylevel.fastinit.cfg`:
+
+- `Loading.OptimizeInfoBundlesOnStartup=true`: enabled by default. Disabling stops future conversions; it does not restore previously optimized files.
+- `Loading.RestoreOriginalInfoBundlesOnStartup=false`: enable and restart to restore originals instead of optimizing. Both current and backup hashes must match the record; later map updates are preserved. Disable this option afterward; also disable optimization if the restored LZMA files should remain unchanged.
+- Legacy `EnableLz4BundleCache` and `Lz4BundleCacheSizeMiB` options are ignored. Scalar catalog and thumbnail caches remain active.
+
+Initial conversion adds startup waiting, shown as `DIY info checking ...`; later startups skip optimized files. Native info loading waits for preparation. Early multiplayer requests retain their copied envelope and acknowledge loading start, then wait for catalog readiness before resource work without announcing kitchen-ready early. Replacement invalidates fingerprinted catalog/thumbnail data once, and originals require additional disk space.
+
+Look for `info bundle optimized in place` and the summary `info bundle startup optimization complete`. Subsequent `info bundle source: ... (source file)` lines refer to the original map path, which can now contain LZ4 data.
+
 ## Version 1.6.17
 
 Extend the working 1.6.16 LZ4 cache to every compatible DIY `info*` bundle. Format version 2 is unchanged, so valid DMM caches remain reusable. All 20 installed info bundles are supported. Unsupported layouts fall back to the source and are remembered for the process; scene bundles, `common*`, and runtime-owned Qichi resources retain their original loaders.
@@ -64,7 +80,7 @@ This version separates the complete level catalog from gameplay resources:
 7. Guard DIY save selection against duplicate clicks, reopening an active dialog or reopening during entry, and repeated save-ready callbacks. Keep a confirmed choice for that frontend, stop its client save countdown, and reuse the choice with a real save-ready reply if the host repeats its request; never send the old save state during entry. Single-player/host and client entry retain the save dialog with input suppressed, hiding only the waiting overlay. Wait for save work while its Update continues, then prepare resources without closing the dialog. Release owned input suppressors on scene arrival and restore only the matching selection on cancellation or failure. Remote clients acknowledge **starting** the load before preparing resources and suppress the duplicate start acknowledgement on replay. Kitchen-ready acknowledgement remains on the original scene path. New selections, connection reset and scene arrival clear the retained choice. Retain incremental hot reload. Refresh is blocked during a level or transition; level selection is blocked during a refresh.
 8. If an async request takes over 15 seconds, log the delay and keep waiting for that same request. Only a completed failed request may fall back to synchronous loading; Unity cannot cancel an unfinished request safely.
 
-Vanilla shared dependencies keep their original reference-counted lifetime. The plugin does not modify the executable, level files, original mod DLL or save format.
+Vanilla shared dependencies keep their original reference-counted lifetime. The plugin backs up and replaces the info files described above; it does not modify the executable, scene bundles, original mod DLL or save format.
 
 ## Limits
 
@@ -76,7 +92,7 @@ The Qichi adapter delegates file reading and decoding to that runtime; its reque
 
 ## Install or roll back
 
-Close the game, back up `BepInEx/plugins/DIYLevelFastInit.dll`, and replace it with the new DLL. To roll back, close the game and restore the backup. The metadata cache can be retained or deleted. Keep backup DLLs outside the plugins scan tree.
+Close the game, back up `BepInEx/plugins/DIYLevelFastInit.dll`, and replace it with the new DLL. To roll back the plugin, close the game and restore its DLL backup. Optimized info files remain loadable; use the restoration setting above first if the original files are also required. The metadata cache can be retained or deleted. Keep backup DLLs outside the plugins scan tree.
 
 ## Build
 
@@ -102,6 +118,8 @@ Output: `bin/Release/DIYLevelFastInit.dll`. Targets .NET Framework 3.5 and C# 7.
 `FastInitPlugin` and `OnDemandResources` retain their type names through partial declarations. Shared fields and initializers remain in their core files in the original order. SDK default source inclusion compiles all files into the same plugin DLL.
 
 ## Verification
+
+Version 1.6.18 passes the Release build, 32 installed-assembly Harmony signatures, 96 frontend assertions, 92 network assertions, 17 server scenarios and 62 save-UI assertions. Source/startup-barrier integration passes 23 assertions, the real worker batch passes 16, and replacement/rollback management passes 41. The new classifier/validator passes 101 checks each under desktop CLR and actual game Mono, including all 20 real bundle outputs and corruption/cancellation cases. Actual Mono also runs workspace copies of test_level and DMM through replacement/backup, second-startup skip, original SHA-256/mtime restoration and rejection of a later map update: all 8 phases / 63 assertions pass. DMM output matches the prior format-2 hash. These checks do not launch the game or alter installed map files; native UI and live networking remain untested. Records are under `../.verification/inplace-1.6.18/` and `../.verification/source-1.6.18/integration/`.
 
 Version 1.6.17 passes the Release build, 61 isolated assertions against production save-UI code, 96 frontend assertions using installed managed types, and 32 Harmony wrappers against installed signatures. Cache-manager checks pass 51 all-map policy assertions, 157 existing assertions, 36 old-Mono compatibility assertions and 25 format/rejection assertions. Actual game x86 Mono builds all 20 bundles and reuses them after reinitialization; independent decoding matches complete payload SHA-256 and CAB/node directories. The final manager also validates all 20 queued entries without changing their LRU times, then hits every cache with zero conversions. Records are under `../.verification/cache-1.6.17/` and `../.verification/save-ui-1.6.17/`. These checks do not launch the game; native save-dialog behavior and live multiplayer still need gameplay regression. The installed DLL was not replaced.
 

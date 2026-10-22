@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.IO;
 using LevelEditorStub;
 using OC2DIYLevel;
 using UnityEngine;
@@ -19,6 +20,17 @@ namespace DIYLevelFastInit
                         if (string.Equals(info.sceneName, scene, StringComparison.OrdinalIgnoreCase))
                         { path = set.Key; return true; }
             path = null;
+            return false;
+        }
+
+        internal static bool TryFindInstalledScenePath(string scene, out string path)
+        {
+            path = null;
+            if (string.IsNullOrEmpty(scene) || scene == "." || scene == ".."
+                || scene.IndexOfAny(new[] { '/', '\\', ':' }) >= 0) return false;
+            foreach (DirectoryInfo dir in FastInitHost.SafeGetDirs(Path.Combine(FastInitPlugin.GetDiyPluginDir(), "levels")))
+                if (File.Exists(Path.Combine(dir.FullName, scene)) && FastInitHost.SafeGetFiles(dir, "info*").Count != 0)
+                { path = dir.FullName; return true; }
             return false;
         }
 

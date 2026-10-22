@@ -157,6 +157,7 @@ namespace DIYLevelFastInit
             try
             {
                 FastInitPlugin.Log.LogInfo("LoadHeavy started");
+                yield return FastInitPlugin.PrepareInfoBundleFiles(pluginDir);
                 // Plugins like WLoader may already keep commonW1/commonW2 resident in memory;
                 // skipping them saves the 1-2 seconds of reading the whole file just to be
                 // rejected as a duplicate by Unity.
