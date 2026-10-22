@@ -4,6 +4,12 @@ Startup and memory optimization for the [OC2DIYLevel](https://github.com/gua248/
 
 [中文说明](README_CN.md)
 
+## Version 1.7.0
+
+Prepare single-player/host and remote-client level resources asynchronously, loading the selected `LevelInfoSO` when its address is valid and generating only that level's configurations. Preserve the complete lightweight catalog, transitive info dependencies and Qichi runtime ownership. Save selection remains visible with input locked until the scene transition; cancelled or replaced requests cannot replay stale loads or unlock newer dialogs.
+
+On startup, convert compatible source `info*` bundles to verified independent LZ4 files in place, retaining originals and guarded restoration records. All loaders use the original map paths. Existing independent bundles are skipped; the initial conversion adds startup waiting. The settings and recovery procedure below apply to 1.7.0. Thumbnail prewarming requires successful StageThumbnailPreview adapter installation; it detects the target type/method rather than the DLL filename and does not read the other mod's own enable setting.
+
 ## Version 1.6.18: optimize source info files at startup
 
 Stop generating or loading separate LZ4 resource caches. On every startup, inspect each map's top-level `info*` files. Skip independent LZ4/raw layouts; convert supported single-block LZMA files serially on a managed worker, verify file hashes, full decoded-data hash, CAB/node directories and versions, then atomically replace the original path. Discovery, previews, host/client entry and original-mod callers all read the optimized source file.
