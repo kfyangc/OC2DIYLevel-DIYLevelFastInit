@@ -8,25 +8,23 @@ Startup and memory optimization for the [OC2DIYLevel](https://github.com/gua248/
 
 Prepare single-player/host and remote-client level resources asynchronously, loading the selected `LevelInfoSO` when its address is valid and generating only that level's configurations. Preserve the complete lightweight catalog, transitive info dependencies and Qichi runtime ownership. Save selection remains visible with input locked until the scene transition; cancelled or replaced requests cannot replay stale loads or unlock newer dialogs.
 
-On startup, convert compatible source `info*` bundles to verified independent LZ4 files in place. All loaders use the original map paths. Existing independent bundles are skipped; the initial conversion adds startup waiting. Thumbnail prewarming requires successful StageThumbnailPreview adapter installation; it detects the target type/method rather than the DLL filename and does not read the other mod's own enable setting.
+On startup, convert compatible source `info*` bundles to verified independent LZ4 files in place, retaining originals and guarded restoration records. All loaders use the original map paths. Existing independent bundles are skipped; the initial conversion adds startup waiting. The settings and recovery procedure below apply to 1.7.0. Thumbnail prewarming requires successful StageThumbnailPreview adapter installation; it detects the target type/method rather than the DLL filename and does not read the other mod's own enable setting.
 
-Supported single-block LZMA inputs are converted serially on a managed worker. Before replacement, verify file hashes, the complete decoded-data hash, CAB/node directories and versions. Atomic replacement temporarily captures the original in `.diylevel-fastinit/original-<GUID>.bundle` with a matching `.record`. After the new source and captured original pass their recorded length/hash checks, delete that original and record to release disk space. Successful optimization does not retain a permanent original or offer restoration after cleanup; obtain a fresh copy of the map if its original LZMA file is needed.
+## Version 1.6.18: optimize source info files at startup
 
-Normal optimization startup also cleans old successful backup/record pairs, but only when the current source has an independent layout and matches the recorded output, and the backup matches the recorded original. Records/backups that do not pass these checks, together with `failed-output-*` and other recovery files, are retained. Mismatched data from later map updates is also preserved. A cleanup failure is reported without rolling back a valid LZ4 source; remaining records/files are retained for a later retry. Backups and temporary files stay in the child directory, outside top-level `info*` enumeration. Replacement and rollback retain recovery data until verification finishes, and cancellation never writes a partial source bundle.
+Stop generating or loading separate LZ4 resource caches. On every startup, inspect each map's top-level `info*` files. Skip independent LZ4/raw layouts; convert supported single-block LZMA files serially on a managed worker, verify file hashes, full decoded-data hash, CAB/node directories and versions, then atomically replace the original path. Discovery, previews, host/client entry and original-mod callers all read the optimized source file.
+
+Originals are retained as `.diylevel-fastinit/original-<GUID>.bundle` beside each map, with a `.record` containing the basename and before/after hashes. Backups and temporary files cannot enter top-level `info*` enumeration. Locked, unsupported, unwritable or invalid inputs remain unchanged and are reported. Commit/rollback retain complete recovery files; cancellation never writes a partial source bundle.
 
 Settings in `BepInEx/config/oc2.diylevel.fastinit.cfg`:
 
-- `Loading.OptimizeInfoBundlesOnStartup=true`: enabled by default. Check supported inputs, convert them, and clean verified successful backup/record pairs. Disabling stops this optimization/cleanup pass; it does not restore previously optimized files.
-- `Loading.RestoreOriginalInfoBundlesOnStartup=false`: legacy/recovery mode for original backups and records that still exist. Restoration takes precedence over optimization and successful-backup cleanup, so those files are not deleted first. Both current and backup hashes must match the record; later map updates are preserved. This cannot restore originals already deleted after successful optimization. Disable this option afterward; also disable optimization if restored LZMA files should remain unchanged.
+- `Loading.OptimizeInfoBundlesOnStartup=true`: enabled by default. Disabling stops future conversions; it does not restore previously optimized files.
+- `Loading.RestoreOriginalInfoBundlesOnStartup=false`: enable and restart to restore originals instead of optimizing. Both current and backup hashes must match the record; later map updates are preserved. Disable this option afterward; also disable optimization if the restored LZMA files should remain unchanged.
 - Legacy `EnableLz4BundleCache` and `Lz4BundleCacheSizeMiB` options are ignored. Scalar catalog and thumbnail caches remain active.
 
-Initial conversion adds startup waiting, shown as `DIY info checking ...`; later startups skip optimized files. Native info loading waits for preparation. Early multiplayer requests retain their copied envelope and acknowledge loading start, then wait for catalog readiness before resource work without announcing kitchen-ready early. Replacement invalidates fingerprinted catalog/thumbnail data once. Conversion needs temporary space for its output and captured original; verified successful originals are then removed.
+Initial conversion adds startup waiting, shown as `DIY info checking ...`; later startups skip optimized files. Native info loading waits for preparation. Early multiplayer requests retain their copied envelope and acknowledge loading start, then wait for catalog readiness before resource work without announcing kitchen-ready early. Replacement invalidates fingerprinted catalog/thumbnail data once, and originals require additional disk space.
 
 Look for `info bundle optimized in place` and the summary `info bundle startup optimization complete`. Subsequent `info bundle source: ... (source file)` lines refer to the original map path, which can now contain LZ4 data.
-
-## Version 1.6.18: historical startup replacement behavior
-
-Version 1.6.18 introduced verified in-place LZ4 conversion instead of separate runtime resource caches. That version retained originals and guarded restoration records in `.diylevel-fastinit` after success. The current 1.7.0 behavior above removes verified successful pairs, including matching older pairs on normal optimization startup. The historical verification results below describe the original 1.6.18 retention/restoration behavior.
 
 ## Version 1.6.17
 
@@ -88,7 +86,7 @@ This version separates the complete level catalog from gameplay resources:
 7. Guard DIY save selection against duplicate clicks, reopening an active dialog or reopening during entry, and repeated save-ready callbacks. Keep a confirmed choice for that frontend, stop its client save countdown, and reuse the choice with a real save-ready reply if the host repeats its request; never send the old save state during entry. Single-player/host and client entry retain the save dialog with input suppressed, hiding only the waiting overlay. Wait for save work while its Update continues, then prepare resources without closing the dialog. Release owned input suppressors on scene arrival and restore only the matching selection on cancellation or failure. Remote clients acknowledge **starting** the load before preparing resources and suppress the duplicate start acknowledgement on replay. Kitchen-ready acknowledgement remains on the original scene path. New selections, connection reset and scene arrival clear the retained choice. Retain incremental hot reload. Refresh is blocked during a level or transition; level selection is blocked during a refresh.
 8. If an async request takes over 15 seconds, log the delay and keep waiting for that same request. Only a completed failed request may fall back to synchronous loading; Unity cannot cancel an unfinished request safely.
 
-Vanilla shared dependencies keep their original reference-counted lifetime. The plugin verifies and replaces the info files described above; it does not modify the executable, scene bundles, original mod DLL or save format.
+Vanilla shared dependencies keep their original reference-counted lifetime. The plugin backs up and replaces the info files described above; it does not modify the executable, scene bundles, original mod DLL or save format.
 
 ## Limits
 
@@ -100,7 +98,7 @@ The Qichi adapter delegates file reading and decoding to that runtime; its reque
 
 ## Install or roll back
 
-Close the game, back up `BepInEx/plugins/DIYLevelFastInit.dll`, and replace it with the new DLL. To roll back the plugin, close the game and restore its DLL backup. Reverting the DLL does not revert optimized info files. The restoration setting only works for matching legacy/recovery files that still exist; after successful originals have been cleaned, obtain a fresh copy of the map to restore its original files. The metadata cache can be retained or deleted. Keep backup DLLs outside the plugins scan tree.
+Close the game, back up `BepInEx/plugins/DIYLevelFastInit.dll`, and replace it with the new DLL. To roll back the plugin, close the game and restore its DLL backup. Optimized info files remain loadable; use the restoration setting above first if the original files are also required. The metadata cache can be retained or deleted. Keep backup DLLs outside the plugins scan tree.
 
 ## Build
 
@@ -126,8 +124,6 @@ Output: `bin/Release/DIYLevelFastInit.dll`. Targets .NET Framework 3.5 and C# 7.
 `FastInitPlugin` and `OnDemandResources` retain their type names through partial declarations. Shared fields and initializers remain in their core files in the original order. SDK default source inclusion compiles all files into the same plugin DLL.
 
 ## Verification
-
-The 1.7.0 successful-backup cleanup passes 76 manager assertions covering deletion, legacy migration, retry, orphan records, locking, hash conflicts, changed maps and cancellation boundaries. Actual game Mono passes all 8 phases / 40 assertions on a workspace map, confirming that successful conversions and legacy cleanup leave no original/record pairs, while a locked backup retains its record and is retried after unlocking. The updated DLL also passes the Release build, 32 Harmony wrappers and 96 frontend assertions. Installed map files were not modified by these checks; records are under `../.verification/backup-cleanup-1.7.0/`.
 
 Version 1.6.18 passes the Release build, 32 installed-assembly Harmony signatures, 96 frontend assertions, 92 network assertions, 17 server scenarios and 62 save-UI assertions. Source/startup-barrier integration passes 23 assertions, the real worker batch passes 16, and replacement/rollback management passes 41. The new classifier/validator passes 101 checks each under desktop CLR and actual game Mono, including all 20 real bundle outputs and corruption/cancellation cases. Actual Mono also runs workspace copies of test_level and DMM through replacement/backup, second-startup skip, original SHA-256/mtime restoration and rejection of a later map update: all 8 phases / 63 assertions pass. DMM output matches the prior format-2 hash. These checks do not launch the game or alter installed map files; native UI and live networking remain untested. Records are under `../.verification/inplace-1.6.18/` and `../.verification/source-1.6.18/integration/`.
 
