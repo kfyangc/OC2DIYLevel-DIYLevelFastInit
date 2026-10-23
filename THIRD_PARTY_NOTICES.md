@@ -1,6 +1,6 @@
 # Third-party notices
 
-The decoder subset in `FastInitPlugin.cs`, under
+The decoder subset in `BundleCodecs/`, under
 `DIYLevelFastInit.BundleCodecs.Compression`, is adapted from Igor Pavlov's
 LZMA SDK 23.01 C# sources. Only the range decoder, bit decoders, output window,
 LZMA constants and LZMA decoder are included. Encoder code is not included.

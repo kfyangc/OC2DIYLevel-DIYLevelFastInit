@@ -1,10 +1,31 @@
 # AGENTS.md
 
-BepInEx 5 plugin (net35, single file `FastInitPlugin.cs`) that patches
+BepInEx 5 plugin (net35) that patches
 [OC2DIYLevel](https://github.com/gua248/Overcooked2-LevelEditor) 0.10.0 for Overcooked! 2.
-Version 1.6.4 keeps a complete lightweight level catalog while loading info resources
+Version 1.7.0 keeps a complete lightweight level catalog while loading info resources
 and building configurations only for the selected level. Async discovery, menu healing,
 the progress indicator, and incremental hot reload remain supported.
+
+## Source layout
+
+- `FastInitPlugin.cs`: plugin identity, shared fields and lifecycle hooks.
+- `Plugin/`: common initialization and progress rendering.
+- `Catalog/`: metadata models, disk/scene caches, discovery and incremental refresh.
+- `Frontend/`: menu rebuilding, save-dialog hooks and confirmed save-choice state.
+- `Networking/`: copied client load requests and the remote entry gate.
+- `Resources/`: shared state/hook registration, info bundles, level preparation,
+  configuration ownership, lifetime cleanup, Qichi and info dependency adapters.
+- `Previews/`: preview requests, thumbnail warmup and the persistent thumbnail cache.
+- `Diagnostics/`: material auditing.
+- `Infrastructure/`: coroutine host, async request helpers and result boxes.
+- `BundleCodecs/`: the attributed LZMA decoder, UnityFS repacker and LZ4 encoder.
+
+`FastInitPlugin` and `OnDemandResources` use partial files to retain their existing
+reflection and Harmony contracts. Keep their fields/initializers together, in their
+original order, in `FastInitPlugin.cs` and `Resources/OnDemandResources.cs` respectively.
+Do not move initializers between partial files or rely on source-file compilation order.
+The 1.6.11 split preserves all 23 top-level types and 410 original members, apart from
+the version constant and partial declarations. It adds no loading or save behaviour.
 
 ## Build / deploy / verify
 
@@ -76,11 +97,79 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   boundaries, initially without heavy `LevelConfig` objects. The cached list snapshot
   is order-sensitive. Retired directories are collected at the next blanket clear.
   The 1.5.x full-directory warm build and blanket-clear suppression have been removed.
-- `OnDemandResources.LoadPrefix` intercepts both `LoadLevelServer` and
-  `LoadLevelClientPatch`. `PrepareLevel` pins the pending scene, loads its full info
-  bundle, replaces a stale session directory if necessary, and prepares the selected
-  level's four configurations before the original code consumes them. Preparing a
-  selected set is synchronous; a large set can briefly stall on first selection.
+- `OnDemandResources.ServerLoadPrefix` queues single-player/host preparation and skips
+  the immediate `LoadLevelServer` body. Yield before native work, drain active preview
+  and warmup requests, pin `_preparingBundles` across async container/info loads, then
+  build one player-count configuration per frame. Only set `_directoryBuild` around
+  each synchronous factory call, never across a yield. Replay `LoadLevelServer` once
+  through a narrowly scoped `_resumeServerLoad` guard after everything is ready.
+  Ignore duplicate server requests while `_serverPreparing`; finally paths release
+  preparation pins/progress and clear the pending scene on failure.
+- `BoostEntryPriority` saves `Application.backgroundLoadingPriority` and temporarily
+  sets `High` after active preview/discovery native requests drain. Its scope covers
+  server resource preparation through target scene arrival; restore on target/frontend
+  `sceneLoaded`, failed/disposed preparation and plugin `OnDestroy`. Restore only while
+  the current value is still `High`, preserving a different value set by another loader.
+  Do not boost ordinary thumbnail warmup, browsing or client callbacks. Keep the scope
+  separate from `_serverPreparing`, which ends at the original scene-load handoff.
+  Bundle and info-asset phase timers plus handoff-to-scene timing support comparisons;
+  priority changes do not guarantee instant entry and may reduce loading-time frame rate.
+- `ClientLoadGate` defers reliable remote DIY `LevelLoadByName` messages at
+  `Mailbox.OnMessageReceived`, before any callback or OC2DIYLevel prefix runs. Snapshot
+  all four message fields and the sender/sequence/reliability envelope: the game registry
+  reuses mutable message instances. Do not retain a borrowed payload or merely return
+  early from `LoadLevelClientPatch`. The latter remains synchronous for replay and direct
+  callers, so the original handler always consumes complete session/level settings.
+- `ClientLoadQueue` coalesces pending duplicates, keeps the newest target, and permits
+  one scoped replay. A request belongs to the exact client mailbox, peer and connection;
+  check identity and the remote-client role after native waits and before replay. Cancel
+  on client reset/loss/kick, non-DIY scene messages, frontend arrival and plugin shutdown.
+  Drain uncancellable native requests before clearing `_clientPreparingBundles`; pin them
+  independently of server preparation. Restore a client latency pause on failed/cancelled
+  preparation only while its connection still matches. Leave unrelated mailbox traffic,
+  vanilla levels and host loopback on their original paths.
+- Client message preparation and handed-off transition ownership are separate. Cancel
+  immediately revokes state filtering, while native requests retain their resource pins
+  until completion. Filtering after handoff belongs to the original mailbox/peer/connection
+  and ends on target scene arrival; stale `_pendingScene` is not a connection identity.
+- Observe official save requests before Team17 opens their dialogs: clear obsolete DIY
+  confirmation/UI ownership and cancel old client/server entry permissions while keeping
+  native drain pins. Remote save guards use current transition identity, not resource
+  pending state, so a cancelled request cannot block a fresh save handshake.
+- Server preparation has a generation and a captured network context. Recheck them after
+  resource waits, between config factories and before handing off. Frontend arrival,
+  connection reset/loss and shutdown invalidate the generation without releasing native
+  request pins early. A cancelled online request must not resume as an offline load.
+- `PrepareResources` shares async bundle/info preparation and per-frame configuration
+  factories between server and gated client entry. Keep `_directoryBuild` scoped to each
+  synchronous factory. A complex individual config or scene activation may still spike.
+- On both server/single-player and remote DIY entry, stop the frontend client save
+  countdown, clear pending DIY save payloads and hide only the save-wait overlay.
+  Retain the save dialog from confirmation through scene arrival, locking input with
+  owned Team17 event-system suppressors before the original callback can hide it.
+  Wait for `CanHide()` without calling `Hide(false)` or `CleanUp`; keep the dialog and
+  its save-slot Update running. Don't Save may skip only its own synchronous ForceClose;
+  real disconnect/invite closes must still run. Release only owned suppressors on
+  scene arrival, cancellation, failure, official selection and shutdown. Failed old
+  requests must not restore or unlock a newer selection. Pass the held view directly
+  to preparation owners before the first yield; never reacquire it from global state
+  after waiting. Prevent countdown restart and
+  stale `LoadedCampaignMapSave` sends during the transition. Announce only the message's
+  start-loading state before native waits; suppress its duplicate during the scoped
+  replay. Never announce `LoadedKitchen` early: the original scene readiness path owns it.
+  State filtering for the queued request requires the current mailbox/peer/connection.
+  For two minutes after a gated entry, log client state sends and disconnect call paths
+  to distinguish load/state problems from session loss; these hooks do not alter errors.
+- Save-dialog guards cover DLC 15 only: suppress same-frame selection reentry, an already
+  visible dialog, dialog reopening during entry, and repeated `OnSaveGameReady` callbacks.
+  Clear duplicate frontend save payloads when suppressing their show attempt, so Update
+  does not retry them indefinitely. `SaveSelectionState` retains only the frontend
+  identity once a choice finishes (including Don't Save), stopping its client countdown.
+  Reuse a confirmed choice and repeat the real save-ready acknowledgement for a duplicate
+  frontend request; never repeat it during level entry. New host selections, client
+  lifecycle resets, target scene arrival and frontend arrival clear the retained choice.
+  Cancellation before confirmation permits reselection. Log successful dialog opens /
+  closes, outgoing save-ready state and the server's updated per-machine/slot states.
 - Public `levelSetInfos` entries remain lightweight SOs with stable identities; full
   `LoadedSet.Info` objects stay private. The directory remains complete for save IDs,
   original dependency lookup, sorting and arcade selection. Never replace it with a
@@ -110,16 +199,21 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   drained and released rather than cancelled or allowed to overwrite a newer image.
   Drain queued unused-asset collection before starting the next preview, so sustained
   browsing cannot accumulate detached asset graphs behind an always-busy worker.
-  `PendingInfos` lets actual level entry join the same native info request. Refresh
+  `PendingLevelInfos` shares the same native request for a selected asset;
+  `PendingInfos` retains the separate full-set fallback request. Refresh
   cancels the preview selection and waits for its worker to drain before mutating sets.
 - With the optional thumbnail adapter installed, `FinishLoading` queues sequential
   thumbnail prewarming over the complete catalog, without requiring menu visits.
-  Pin `_warmBundles` while native requests run; keep full `LevelSetInfo` only in the
-  current worker, write one copied image per frame, drain the bounded disk writer,
-  release source references and wait for unused-asset collection before the next set.
+  Pin `_warmBundles` while native requests run. Load selected LevelInfo assets, copy
+  one image per frame, and release/wait for cleanup between direct levels. If full-set
+  fallback is needed, reuse that graph for the remaining batch before releasing it.
   Pause for gameplay, transitions and uncached foreground previews. Refresh invalidates
   the warmup generation and waits for native requests to drain before changing entries.
   Cached foreground images bypass the warmup wait and cleanup queue.
+  Preview waits for warmup, cleanup and discovery must check `PreviewIsCurrent` each
+  frame. A new pending scene cancels that request; waiting unconditionally for cleanup
+  would deadlock server preparation waiting for the preview worker to drain, because
+  cleanup is deferred during transitions.
 - `ThumbnailCache` persists versioned `.thumb` files containing a source stamp, bounded
   dimensions, a SHA-256 checksum and PNG data; empty payloads record absent screenshots.
   It fingerprints all info/common source files by path, length and UTC modification time.
@@ -148,6 +242,17 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   `PendingBundles` lets synchronous entry join the same native async request; never
   start a duplicate file load while that request is pending. Defer menu selection and
   thumbnail loading during a cold info request.
+- `QichiResources` prepares `qichi_assets` before any `info_qichi` container is consumed,
+  including cold discovery, source previews and both entry paths. Resolve the optional
+  Qichi runtime v10 APIs by reflection, join its existing native request or reuse the
+  resident bundle, then synchronize its request/loading/loaded fields and shared loader
+  reference. Do not start a duplicate while a request is pending. Qichi owns this bundle;
+  never add it to FastInit's info cleanup. File reading and decoding remain in Qichi's
+  runtime. The adapter covers the known info filename, not arbitrary external packages.
+  Log the runtime request startup separately: its synchronous file read/decode occurs
+  before the Unity async request and must not be described as a non-blocking phase.
+  Verify a fresh-process `s_qichi_1_5` entry and its dungeon meshes/materials separately
+  from the cross-set `s_zhuzi_2` info dependency regression.
 - The reader targets UnityFS v6 / serialized-file versions 9–21 used by this Unity
   2017 game, with bounded uncompressed, LZ4 and LZMA prefix decoding. LZMA decoder
   code is an adapted public-domain SDK subset in the same source file; retain
@@ -180,6 +285,61 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
   contract with the compiled OC2DIYLevel 0.10.0 — if that plugin updates, re-verify against
   its decompiled source at `C:\Users\yang\.cache\OC2DIYLevel-decompiled\OC2DIYLevel_src\`.
 
+## Selected level assets
+
+- `LoadedSet.Info` is optional and holds only the full-set compatibility fallback;
+  `LoadedLevels` stores selected native LevelInfo assets by scene. Public catalog SOs
+  remain lightweight and stable. Cold scalar-catalog discovery still reads full info.
+- Resolve metadata SO names through `LevelAssetIndex` with unique case-insensitive
+  basenames. Validate loaded type/name/scene; unknown, ambiguous and failed addresses
+  fall back only after native completion and while that consumer is still current.
+- `PendingLevelInfos` uses set-path plus asset-address keys, separate from full-set
+  `PendingInfos`. Synchronous consumers must join a pending native asset request and
+  must never issue a competing request/fallback while it remains incomplete.
+- `ReleaseUnused` drops per-level references for departed scenes and retains the exact
+  uncached preview scene. Keep container/CAB dependencies and cache-file leases until
+  their last active, pending, preview or warmup owner has finished.
+
+## Startup info bundle optimization
+
+- The owner authorized replacing `info*` files in 1.6.18. `InfoBundleOptimizer`
+  converts supported single-block LZMA inputs and atomically replaces their original
+  paths only after `ValidateConverted` checks output/source file hashes, complete
+  decoded-data hash, block bounds and equivalent versions/CAB/node metadata.
+- Generated independent blocks use flags `0x02`/`0x00`, never the source's Streamed
+  bit `0x40`; the installed Unity's LZ4 stream callbacks fail. A generic parser or
+  successful managed conversion does not establish full native Unity acceptance.
+- `InfoBundleOptimizationBatch` owns one cancellable managed worker. Its callbacks
+  only enqueue diagnostics; main-thread Update drains them. Set `InfoFilesPreparing`
+  before cheap initialization and retain it until the worker has fully exited, including
+  coroutine disposal. Never call Unity or BepInEx from the worker.
+- Complete this startup phase before any info graph/catalog/preview/native request.
+  Keep synchronous `common` initialization and IsInitialized timing unchanged. Do not
+  replace files during hot refresh. Early remote DIY messages may use a basename-only
+  file lookup while the catalog is empty, but must retain copied payloads, acknowledge
+  start and wait for startup/catalog completion before BeginClientPreparation. Setting
+  `_pendingScene` early would deadlock discovery's transition wait.
+- Every set's `.diylevel-fastinit` child directory holds the cross-process lock,
+  GUID temporary files and unique `original-<GUID>.bundle` / `.record` pairs. Never put
+  backup/temp files matching `info*` at the set root. Never overwrite an existing backup.
+  Record basenames only with bounded lengths; validate record extents and hashes.
+- Use the installed Mono's supported atomic File.Replace with a unique backup. There
+  is no truncate/copy-over-source fallback. Recheck source identity/hash under an
+  exclusive handle before commit; verify the captured backup and new source afterward.
+  Commit and rollback are non-cancellable critical sections retaining both versions.
+  Unsupported, locked and failed inputs retain usable originals; clean only owned temps.
+- Restore mode takes precedence over optimization, only replaces a source matching the
+  recorded optimized hash, validates the original backup, and preserves the displaced
+  optimized copy. Never restore over a later map update or corrupt recovery record.
+- Existing independent LZ4/raw layouts skip conversion after bounded structural checks.
+  Do not rewrite their timestamps each startup. File-length/mtime fingerprints must
+  invalidate catalog, graph and thumbnail data naturally when replacement occurs.
+- `BundleFileCache` remains legacy managed code for historical compatibility checks;
+  production no longer Configure/Queue/Acquire/Tick it or select its physical paths.
+  Old bundle-cache options are ignored. Scalar catalog/thumbnail caches are separate.
+- `UnityFsRepacker` streams 128 KiB output blocks with bounded buffers and the original
+  LZMA dictionary. Never retain the entire resource payload or clamp its dictionary.
+
 ## Constraints
 
 - Target framework net35 / C# 7.3: no ValueTuples, no `yield` inside try/catch.
@@ -188,19 +348,29 @@ Copy-Item -LiteralPath bin/Release/DIYLevelFastInit.dll -Destination "<GameDir>/
 - Plugin dir must be resolved from `typeof(DIYLevelAssetBundleManager).Assembly.Location`,
   never `GetExecutingAssembly()` (would point at this plugin's own directory).
 - Keep `common*` bundles loaded before consuming `info_*` bundles (dependency resolution).
-- The smallest heavy-resource loading unit is one info bundle, plus any transitive
-  info dependencies of the selected scene/set, not one individual map. Common bundles
-  and other mods' retained assets remain outside this
-  plugin's cleanup scope. Preserve this distinction in memory claims.
+- Container loading includes one info bundle plus transitive dependencies of the
+  selected scene/set. Object loading requests a unique selected LevelInfo asset when
+  available, otherwise the full LevelSetInfo fallback. Do not equate this with splitting
+  the bundle file or removing selected-level dependencies. Common bundles and other
+  mods' retained assets remain outside this plugin's cleanup scope.
 
 ## Code style
 
 - Comments in English, minimal: one class-level `<summary>` plus single-line `//` notes
-  only where the code can't speak (see current file).
+  only where the code can't speak. Keep the existing style across the partial files.
 - Chinese only in functional UI/localization strings. If any non-ASCII source is added,
   keep the UTF-8 BOM (csc otherwise reads the file as the system codepage).
 
 ## Build gotchas
+
+- This installed Mono's `FileStream` and `MonoIO` can throw
+  `System.IO.IsolatedStorage.IsolatedStorageException` for missing files/paths. It derives
+  directly from `Exception`, not `IOException`. Cache miss/race handling must cover it;
+  do not rely only on desktop CLR file exceptions. Verify empty-cache creation against
+  the actual game runtime, and keep simulator results distinct from native execution.
+  The bundled corlib also lacks the public six-argument `FileStream(..., FileOptions)`
+  overload. Use the supported five-argument buffered constructor; compile managed-only
+  cache/codec probes against the actual game corlib as an additional API check.
 
 - The `UnityEngine.dll` facade alone is not enough: module references
   (CoreModule, AssetBundleModule, ImageConversionModule, IMGUIModule, TextRenderingModule,
